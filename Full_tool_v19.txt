@@ -14,6 +14,8 @@ import threading
 import csv
 import tempfile
 import subprocess
+import time
+import concurrent.futures
 from datetime import datetime
 import pandas as pd
 from pyNastran.bdf.bdf import BDF
@@ -1265,6 +1267,7 @@ class BarPropertySolverTab:
         self.bar_min_thickness = tk.StringVar(value="2.0")
         self.bar_max_thickness = tk.StringVar(value="12.0")
         self.thickness_step = tk.StringVar(value="0.5")
+        self.max_parallel_runs = tk.StringVar(value="1")  # 1 = sequential (previous behavior)
 
         # Data storage
         self.bdf_model = None
@@ -1274,10 +1277,9 @@ class BarPropertySolverTab:
         self.bar_structure_map = {}       # PID -> Structure Name
         self.structure_groups = {}        # Structure Name -> [PID list]
         self.pbarl_dims = {}              # PID -> {'dim1': val, 'dim2': val} from BDF
-        self.current_bar_thicknesses = {} # PID -> thickness
+        self.current_bar_thicknesses = {} # PID -> base thickness (used when building/offsetting the base model)
         self.current_skin_thicknesses = {}# PID -> effective thickness (Excel 'Skin Property' if given, else BDF), for base model + offsets
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
-        self.active_group_pids = None      # Set of PIDs for active sweep group (None = all)
         self.material_densities = {}      # MID -> density
         self.prop_to_material = {}        # PID -> MID
         self.element_areas = {}
@@ -1419,6 +1421,14 @@ class BarPropertySolverTab:
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Step:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.thickness_step, width=8).pack(side=tk.LEFT, padx=5)
+
+        row3 = ttk.Frame(f2)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text="Max Parallel Runs:").pack(side=tk.LEFT)
+        ttk.Entry(row3, textvariable=self.max_parallel_runs, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row3, text="(1 = one Nastran run at a time; e.g. 5 = up to 5 at once - "
+                              "check available Nastran licenses/CPU/RAM first)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # ---- Section 3: Actions ----
         f3 = ttk.LabelFrame(main, text="3. Actions", padding=10)
@@ -1915,7 +1925,12 @@ class BarPropertySolverTab:
             self.resid_status.config(text="Error", foreground="red")
 
     # ==================== BDF WRITING ====================
-    def _write_bdf_for_model(self, folder, model, original_path):
+    def _write_bdf_for_model(self, folder, model, original_path, thickness_overrides):
+        """thickness_overrides: {pid: new_dim1}. Only these PBARL PIDs are
+        rewritten; every other card in original_path (the base model) is left
+        untouched. Taking the overrides as an explicit argument - instead of
+        reading a shared self.current_bar_thicknesses/active_group_pids state -
+        is what makes this safe to call from multiple threads at once."""
         output_bdf = os.path.join(folder, os.path.basename(original_path))
 
         with open(original_path, 'r', encoding='latin-1') as f:
@@ -1929,13 +1944,8 @@ class BarPropertySolverTab:
             if line.startswith('PBARL'):
                 try:
                     pid = int(line[8:16].strip())
-                    # Only update PIDs in the active group; others stay as original BDF
-                    active_pids = getattr(self, 'active_group_pids', None)
-                    should_update = (pid in self.current_bar_thicknesses and
-                                     (active_pids is None or pid in active_pids))
-                    if should_update:
-                        t = self.current_bar_thicknesses[pid]
-                        t = max(0.1, t)
+                    if pid in thickness_overrides:
+                        t = max(0.1, thickness_overrides[pid])
                         new_lines.append(line)
                         i += 1
                         while i < len(lines) and (
@@ -2070,7 +2080,7 @@ class BarPropertySolverTab:
         # there is a real baseline result (Excel thicknesses, no group swept yet)
         # to compare every sweep step against - not just a geometry/offset step.
         self.log("\n  Running Nastran + stress extraction on the BASE MODEL (baseline, before any sweep)...")
-        base_stresses, base_combined = self._run_single_iteration(base_folder)
+        base_stresses, base_combined = self._run_single_iteration(base_folder, {}, label="[BASE] ")
         self.base_stresses = base_stresses
         self.base_combined_stresses = base_combined
         if base_stresses:
@@ -2290,10 +2300,10 @@ class BarPropertySolverTab:
             return bdf_path
 
     # ==================== NASTRAN EXECUTION ====================
-    def _run_nastran(self, bdf_path, folder):
+    def _run_nastran(self, bdf_path, folder, label=""):
         nastran = self.nastran_path.get()
         if not nastran or not os.path.exists(nastran):
-            self.log("    WARNING: Nastran exe not found!")
+            self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
         try:
             cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes batch=no'
@@ -2301,13 +2311,52 @@ class BarPropertySolverTab:
             if mem:
                 cmd += f' mem={mem}'
             proc = subprocess.Popen(cmd, shell=True)
-            proc.wait(timeout=600)
+            proc.wait()  # block until the launched process actually exits - no artificial timeout
+            returncode = proc.returncode
+            if returncode != 0:
+                self.log(f"    {label}WARNING: Nastran exited with code {returncode}")
+
+            # Some Nastran launchers (notably on Windows) return before the actual
+            # solver they spawned has finished writing output. Don't trust process
+            # exit alone - wait for the .op2 to appear and stop growing.
+            if not self._wait_for_op2(bdf_path, folder, label=label):
+                self.log(f"    {label}WARNING: .op2 never appeared/finished writing - treating run as failed")
+                return False
             return True
-        except:
+        except Exception as e:
+            self.log(f"    {label}Nastran run error: {e}")
             return False
 
+    def _wait_for_op2(self, bdf_path, folder, timeout=3600, poll_interval=5, stable_checks=3, label=""):
+        """Poll for <bdf-basename>.op2 in folder to appear and its file size to
+        stop changing for `stable_checks` consecutive polls, since the run
+        process exiting is not a reliable "solve finished" signal for every
+        Nastran launcher. Returns True once the file looks complete."""
+        base = os.path.splitext(os.path.basename(bdf_path))[0]
+        op2_path = os.path.join(folder, base + '.op2')
+        start = time.time()
+        last_size = -1
+        stable = 0
+        while time.time() - start < timeout:
+            if os.path.exists(op2_path):
+                size = os.path.getsize(op2_path)
+                if size > 0 and size == last_size:
+                    stable += 1
+                    if stable >= stable_checks:
+                        return True
+                else:
+                    stable = 0
+                last_size = size
+            time.sleep(poll_interval)
+        self.log(f"    {label}WARNING: timed out after {timeout}s waiting for {os.path.basename(op2_path)}")
+        return os.path.exists(op2_path) and os.path.getsize(op2_path) > 0
+
     # ==================== STRESS EXTRACTION ====================
-    def _extract_stresses(self, folder):
+    def _extract_stresses(self, folder, thickness_overrides):
+        """thickness_overrides: {pid: dim1} for the group actively swept in this
+        iteration (empty for the base model run). PIDs not in it use their base
+        self.bar_properties dim1 - same explicit-argument approach as
+        _write_bdf_for_model, so concurrent iterations don't race on shared state."""
         results = []
         bar_stress_rows = []
 
@@ -2327,7 +2376,7 @@ class BarPropertySolverTab:
                                 d1 = d2 = area = stress = None
 
                                 if pid and pid in self.bar_properties:
-                                    d1 = self.current_bar_thicknesses.get(pid, self.bar_properties[pid].get('dim1', 0))
+                                    d1 = thickness_overrides.get(pid, self.bar_properties[pid].get('dim1', 0))
                                     if pid in self.pbarl_dims:
                                         d2 = self.pbarl_dims[pid]['dim2']
                                     else:
@@ -2483,13 +2532,18 @@ class BarPropertySolverTab:
         return None
 
     # ==================== SINGLE THICKNESS ITERATION ====================
-    def _run_single_iteration(self, folder):
-        """Run Nastran for current thicknesses (layered on the pre-built base model)
-        and extract stresses. The base model (Excel Bar/Skin properties + offsets)
-        is built once per sweep in _build_base_model - offsets are not recomputed here."""
+    def _run_single_iteration(self, folder, thickness_overrides, label=""):
+        """Run Nastran for thickness_overrides (layered on the pre-built base
+        model) and extract stresses. thickness_overrides is {} for the base
+        model's own baseline run. The base model (Excel Bar/Skin properties +
+        offsets) is built once per sweep in _build_base_model - offsets are not
+        recomputed here. Takes thickness_overrides as an explicit argument
+        (rather than reading shared instance state) so this can safely be
+        called from multiple threads at once for different thickness values."""
         try:
             n_bdfs = len(self.bdf_models) if self.bdf_models else 1
             all_stresses = []
+            any_run_ok = False
 
             for bdf_idx, bdf_info in enumerate(self.bdf_models):
                 bdf_name = bdf_info['name']
@@ -2497,39 +2551,44 @@ class BarPropertySolverTab:
                 os.makedirs(bdf_subfolder, exist_ok=True)
 
                 if n_bdfs > 1:
-                    self.log(f"    --- BDF {bdf_idx + 1}/{n_bdfs}: {bdf_name} ---")
+                    self.log(f"    {label}--- BDF {bdf_idx + 1}/{n_bdfs}: {bdf_name} ---")
 
                 # 1. Write the active group's bar thickness on top of the base model
                 base_source = bdf_info.get('base_path', bdf_info['path'])
-                bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source)
+                bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source, thickness_overrides)
 
-                # 2. Run Nastran (offsets already applied once on the base model)
-                self.log("    Running Nastran...")
-                self._run_nastran(bdf_path, bdf_subfolder)
+                # 2. Run Nastran (offsets already applied once on the base model) and
+                #    WAIT for it to actually finish (incl. the .op2 being fully written)
+                self.log(f"    {label}Running Nastran...")
+                ok = self._run_nastran(bdf_path, bdf_subfolder, label=label)
+                if not ok:
+                    self.log(f"    {label}Nastran run failed/incomplete for {bdf_name} - skipping stress extraction for it")
+                    continue
+                any_run_ok = True
 
-                # 3. Extract stresses
-                stresses = self._extract_stresses(bdf_subfolder)
+                # 3. Extract stresses (only once the run above is confirmed done)
+                stresses = self._extract_stresses(bdf_subfolder, thickness_overrides)
                 all_stresses.extend(stresses)
 
                 if stresses:
                     bar_s = [s for s in stresses if s['type'] == 'bar']
                     shell_s = [s for s in stresses if s['type'] == 'shell']
-                    self.log(f"    Extracted: {len(bar_s)} bar, {len(shell_s)} shell stresses")
+                    self.log(f"    {label}Extracted: {len(bar_s)} bar, {len(shell_s)} shell stresses")
 
             stresses = all_stresses
 
             # Combine stresses using Residual Strength
             combined_stresses = None
-            if self.residual_strength_df is not None:
-                self.log("    Combining stresses...")
+            if any_run_ok and self.residual_strength_df is not None:
+                self.log(f"    {label}Combining stresses...")
                 combined_stresses = self._combine_stresses_multi(folder, n_bdfs)
                 if combined_stresses:
-                    self.log(f"    Combined: {len(combined_stresses)} stress combinations")
+                    self.log(f"    {label}Combined: {len(combined_stresses)} stress combinations")
 
             return stresses, combined_stresses
 
         except Exception as e:
-            self.log(f"  Iteration ERROR: {e}")
+            self.log(f"  {label}Iteration ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
             return [], None
@@ -2589,6 +2648,12 @@ class BarPropertySolverTab:
             self.log(f"  Total iterations: {total_steps}")
             self.log(f"  Output: {run_folder}")
 
+            try:
+                max_parallel = max(1, int(float(self.max_parallel_runs.get())))
+            except (ValueError, TypeError):
+                max_parallel = 1
+            self.log(f"  Max parallel Nastran runs: {max_parallel}")
+
             # Build the base model ONCE (Excel Bar/Skin properties + offsets) before
             # any structure group's runs start. Every sweep iteration below only
             # changes its active group's bar thickness on top of this base model.
@@ -2608,60 +2673,65 @@ class BarPropertySolverTab:
                 group_folder = os.path.join(run_folder, struct_name)
                 os.makedirs(group_folder, exist_ok=True)
 
-                group_results = []
+                group_results_by_idx = [None] * len(thicknesses)
 
-                for t_idx, thickness in enumerate(thicknesses):
-                    if not self.is_running:
-                        break
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                    future_to_meta = {}
+                    for t_idx, thickness in enumerate(thicknesses):
+                        if not self.is_running:
+                            break
 
-                    current_step += 1
-                    progress = (current_step / total_steps) * 100
-                    self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                        label = f"[{struct_name} t={thickness:.2f}] "
+                        thickness_overrides = {pid: thickness for pid in pids}
 
-                    self.log(f"\n  --- {struct_name}: t = {thickness:.2f} mm ({t_idx + 1}/{len(thicknesses)}) ---")
+                        iter_folder = os.path.join(group_folder, f"t_{thickness:.2f}")
+                        os.makedirs(iter_folder, exist_ok=True)
 
-                    # Set thickness for this group only, mark active group
-                    self.active_group_pids = set(pids)
-                    for pid in pids:
-                        self.current_bar_thicknesses[pid] = thickness
+                        self.log(f"\n  --- {struct_name}: submitting t = {thickness:.2f} mm ({t_idx + 1}/{len(thicknesses)}) ---")
+                        future = executor.submit(self._run_single_iteration, iter_folder, thickness_overrides, label)
+                        future_to_meta[future] = (t_idx, thickness)
 
-                    # Create iteration folder
-                    iter_folder = os.path.join(group_folder, f"t_{thickness:.2f}")
-                    os.makedirs(iter_folder, exist_ok=True)
+                    completed = 0
+                    for future in concurrent.futures.as_completed(future_to_meta):
+                        t_idx, thickness = future_to_meta[future]
+                        completed += 1
+                        current_step += 1
+                        progress = (current_step / total_steps) * 100
+                        self.root.after(0, lambda p=progress: self.progress_var.set(p))
 
-                    # Run iteration
-                    stresses, combined_stresses = self._run_single_iteration(iter_folder)
+                        try:
+                            stresses, combined_stresses = future.result()
+                        except Exception as e:
+                            self.log(f"    [{struct_name} t={thickness:.2f}] Iteration raised an exception: {e}")
+                            stresses, combined_stresses = [], None
 
-                    # Collect stress results for this group's properties
-                    group_stress_data = self._collect_group_stresses(
-                        pids, stresses, combined_stresses
-                    )
+                        self.log(f"\n  --- {struct_name}: t = {thickness:.2f} mm done ({completed}/{len(thicknesses)}) ---")
 
-                    result_entry = {
-                        'thickness': thickness,
-                        'stresses': group_stress_data,
-                        'raw_stress_count': len(stresses),
-                        'combined_count': len(combined_stresses) if combined_stresses else 0,
-                    }
-                    group_results.append(result_entry)
+                        # Collect stress results for this group's properties
+                        group_stress_data = self._collect_group_stresses(
+                            pids, stresses, combined_stresses
+                        )
 
-                    # Log summary for this thickness
-                    if group_stress_data:
-                        max_stress = max(s['stress'] for s in group_stress_data) if group_stress_data else 0
-                        avg_stress = np.mean([s['stress'] for s in group_stress_data]) if group_stress_data else 0
-                        self.log(f"    Max stress: {max_stress:.2f}, Avg stress: {avg_stress:.2f}")
-                        self.log(f"    Elements in group: {len(group_stress_data)}")
+                        group_results_by_idx[t_idx] = {
+                            'thickness': thickness,
+                            'stresses': group_stress_data,
+                            'raw_stress_count': len(stresses),
+                            'combined_count': len(combined_stresses) if combined_stresses else 0,
+                        }
 
+                        # Log summary for this thickness
+                        if group_stress_data:
+                            max_stress = max(s['stress'] for s in group_stress_data) if group_stress_data else 0
+                            avg_stress = np.mean([s['stress'] for s in group_stress_data]) if group_stress_data else 0
+                            self.log(f"    Max stress: {max_stress:.2f}, Avg stress: {avg_stress:.2f}")
+                            self.log(f"    Elements in group: {len(group_stress_data)}")
+
+                # Keep thickness order regardless of which iteration finished first
+                group_results = [r for r in group_results_by_idx if r is not None]
                 self.sweep_results[struct_name] = group_results
 
                 # Save group summary
                 self._save_group_summary(group_folder, struct_name, group_results, pids)
-
-                # Reset thicknesses for this group back to the base-model value
-                # (Excel 'Bar Property' sheet, or BDF fallback if not in Excel)
-                self.active_group_pids = None
-                for pid in pids:
-                    self.current_bar_thicknesses[pid] = self.bar_properties.get(pid, {}).get('dim1', bar_min)
 
             # Save overall summary
             if self.is_running:
