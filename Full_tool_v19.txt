@@ -2356,7 +2356,7 @@ class BarPropertySolverTab:
             # Some Nastran launchers (notably on Windows) return before the actual
             # solver they spawned has finished writing output. Don't trust process
             # exit alone - wait for the .op2 to appear and stop growing.
-            if not self._wait_for_op2(bdf_path, folder, label=label):
+            if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
                 self.log(f"    {label}WARNING: .op2 never appeared/finished writing - treating run as failed")
                 return False
             return True
@@ -2370,29 +2370,86 @@ class BarPropertySolverTab:
             if made_temp_scratch and os.path.isdir(run_scratch_dir):
                 shutil.rmtree(run_scratch_dir, ignore_errors=True)
 
-    def _wait_for_op2(self, bdf_path, folder, timeout=3600, poll_interval=5, stable_checks=3, label=""):
-        """Poll for <bdf-basename>.op2 in folder to appear and its file size to
-        stop changing for `stable_checks` consecutive polls, since the run
-        process exiting is not a reliable "solve finished" signal for every
-        Nastran launcher. Returns True once the file looks complete."""
+    def _describe_run_progress(self, dirs, base):
+        """Diagnostic string for the heartbeat below: which of the usual Nastran
+        output files exist yet in the watched folder(s), and their size."""
+        parts = []
+        seen = set()
+        for d in dirs:
+            if not d or d in seen or not os.path.isdir(d):
+                continue
+            seen.add(d)
+            for ext in ('.f04', '.f06', '.log', '.op2'):
+                p = os.path.join(d, base + ext)
+                if os.path.exists(p):
+                    try:
+                        parts.append(f"{os.path.basename(p)}={os.path.getsize(p)}B")
+                    except OSError:
+                        pass
+        return ", ".join(parts) if parts else "no output files found yet in any watched folder"
+
+    def _wait_for_op2(self, bdf_path, folder, scratch_dir=None, timeout=3600, poll_interval=5,
+                       stable_checks=3, heartbeat_every=30, label=""):
+        """Poll for <bdf-basename>.op2 to appear and its file size to stop
+        changing for `stable_checks` consecutive polls, since the run process
+        exiting is not a reliable "solve finished" signal for every Nastran
+        launcher. Checks both `folder` (the out= target) and `scratch_dir` (in
+        case this Nastran install actually writes results there instead), and
+        logs a heartbeat every `heartbeat_every` seconds with whatever output
+        files it currently sees, so a long or failed solve is visible instead
+        of the tool looking frozen with no feedback at all."""
         base = os.path.splitext(os.path.basename(bdf_path))[0]
-        op2_path = os.path.join(folder, base + '.op2')
+        search_dirs = [folder] + ([scratch_dir] if scratch_dir and scratch_dir != folder else [])
         start = time.time()
         last_size = -1
         stable = 0
+        last_heartbeat = 0.0
+
         while time.time() - start < timeout:
-            if os.path.exists(op2_path):
+            elapsed = time.time() - start
+            op2_path = None
+            op2_dir = None
+            for d in search_dirs:
+                candidate = os.path.join(d, base + '.op2')
+                if os.path.exists(candidate):
+                    op2_path = candidate
+                    op2_dir = d
+                    break
+
+            if op2_path:
                 size = os.path.getsize(op2_path)
                 if size > 0 and size == last_size:
                     stable += 1
                     if stable >= stable_checks:
+                        if op2_dir != folder:
+                            self.log(f"    {label}NOTE: .op2 appeared in {op2_dir} (not the out= folder) - copying it to {folder}")
+                            try:
+                                shutil.copy2(op2_path, os.path.join(folder, base + '.op2'))
+                            except Exception as e:
+                                self.log(f"    {label}WARNING: could not copy .op2 into {folder}: {e}")
                         return True
                 else:
                     stable = 0
                 last_size = size
+
+            if elapsed - last_heartbeat >= heartbeat_every:
+                last_heartbeat = elapsed
+                self.log(f"    {label}...still waiting for Nastran ({int(elapsed)}s elapsed): "
+                          f"{self._describe_run_progress(search_dirs, base)}")
+
             time.sleep(poll_interval)
-        self.log(f"    {label}WARNING: timed out after {timeout}s waiting for {os.path.basename(op2_path)}")
-        return os.path.exists(op2_path) and os.path.getsize(op2_path) > 0
+
+        self.log(f"    {label}WARNING: timed out after {timeout}s waiting for {base}.op2")
+        for d in search_dirs:
+            candidate = os.path.join(d, base + '.op2')
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                if d != folder:
+                    try:
+                        shutil.copy2(candidate, os.path.join(folder, base + '.op2'))
+                    except Exception:
+                        pass
+                return True
+        return False
 
     # ==================== STRESS EXTRACTION ====================
     def _extract_stresses(self, folder, thickness_overrides):
