@@ -2524,10 +2524,13 @@ class BarPropertySolverTab:
 
                                 if pid and pid in self.bar_properties:
                                     d1 = thickness_overrides.get(pid, self.bar_properties[pid].get('dim1', 0))
-                                    if pid in self.pbarl_dims:
-                                        d2 = self.pbarl_dims[pid]['dim2']
-                                    else:
-                                        d2 = self.bar_properties[pid].get('dim2', d1)
+                                    # dim2 must come from self.bar_properties (the Excel 'Bar
+                                    # Property' sheet, with BDF as its own fallback - see
+                                    # load_properties) - NOT self.pbarl_dims directly, which is
+                                    # always the raw original BDF value and previously overrode
+                                    # the Excel dim2 here even when Excel provided one, making
+                                    # the reported stress use the wrong area.
+                                    d2 = self.bar_properties[pid].get('dim2', d1)
                                     area = d1 * d2
                                     if area > 0:
                                         stress = axial / area
