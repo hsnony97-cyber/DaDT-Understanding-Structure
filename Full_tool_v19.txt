@@ -1295,6 +1295,8 @@ class BarPropertySolverTab:
         # Run state
         self.is_running = False
         self.sweep_results = {}  # Structure Name -> [{thickness, stresses, ...}]
+        self.base_stresses = None          # Raw stresses from the base model (baseline, before any sweep)
+        self.base_combined_stresses = None # Combined (Residual Strength) stresses from the base model
 
         self.setup_ui()
 
@@ -2063,6 +2065,23 @@ class BarPropertySolverTab:
 
             bdf_info['base_path'] = base_path
             self.log(f"  Base model ready for {bdf_info['name']}: {os.path.basename(base_path)}")
+
+        # Run Nastran + extract/combine stresses on the base model itself too, so
+        # there is a real baseline result (Excel thicknesses, no group swept yet)
+        # to compare every sweep step against - not just a geometry/offset step.
+        self.log("\n  Running Nastran + stress extraction on the BASE MODEL (baseline, before any sweep)...")
+        base_stresses, base_combined = self._run_single_iteration(base_folder)
+        self.base_stresses = base_stresses
+        self.base_combined_stresses = base_combined
+        if base_stresses:
+            bar_s = [s for s in base_stresses if s['type'] == 'bar']
+            shell_s = [s for s in base_stresses if s['type'] == 'shell']
+            self.log(f"  Base model stresses: {len(bar_s)} bar, {len(shell_s)} shell")
+        else:
+            self.log("  WARNING: no stresses extracted from the base model (check Nastran path/run).")
+        if base_combined:
+            self.log(f"  Base model combined stresses: {len(base_combined)} rows")
+        self.log(f"  Base model results saved under: {base_folder}")
 
         self.log("BASE MODEL READY - sweep will now vary each group's bar thickness on top of it.\n")
 
