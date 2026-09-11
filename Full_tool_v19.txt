@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import csv
+import shutil
 import tempfile
 import subprocess
 import time
@@ -1261,6 +1262,7 @@ class BarPropertySolverTab:
         self.residual_strength_path = tk.StringVar()
         self.nastran_path = tk.StringVar()
         self.nastran_memory = tk.StringVar(value="")
+        self.scratch_folder = tk.StringVar(value="")  # optional; blank = each run's own output folder (still collision-free)
         self.output_folder = tk.StringVar()
 
         # Thickness ranges
@@ -1395,6 +1397,22 @@ class BarPropertySolverTab:
         ttk.Label(mem_frame, text="Requested Memory:", width=18).pack(side=tk.LEFT)
         ttk.Entry(mem_frame, textvariable=self.nastran_memory, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Label(mem_frame, text="(optional, e.g. 4gb / 500mb - blank = Nastran default)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # NX Nastran Scratch Folder (optional; each run gets its own unique
+        # subfolder under it, so parallel runs never collide on scratch files)
+        scr_frame = ttk.Frame(f1)
+        scr_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(scr_frame, text="Scratch Folder:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(scr_frame, textvariable=self.scratch_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(scr_frame, text="Browse", command=lambda: self.scratch_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+        scr_hint = ttk.Frame(f1)
+        scr_hint.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - each Nastran run gets its own "
+                                  "unique scratch subfolder here, so parallel runs never collide; "
+                                  "blank = each run's own output folder)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output Folder
@@ -2305,8 +2323,22 @@ class BarPropertySolverTab:
         if not nastran or not os.path.exists(nastran):
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
+
+        # Give this run its own scratch subdirectory so concurrent runs (when
+        # Max Parallel Runs > 1) never share/collide on scratch files. If the
+        # user set a Scratch Folder, put it there (e.g. a fast local disk);
+        # otherwise fall back to this run's own output folder, which is
+        # already unique per iteration.
+        scratch_base = self.scratch_folder.get().strip()
+        run_scratch_dir = folder
+        made_temp_scratch = False
         try:
-            cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes batch=no'
+            if scratch_base:
+                os.makedirs(scratch_base, exist_ok=True)
+                run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
+                made_temp_scratch = True
+
+            cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes sdirectory="{run_scratch_dir}" batch=no'
             mem = self.nastran_memory.get().strip()
             if mem:
                 cmd += f' mem={mem}'
@@ -2326,6 +2358,12 @@ class BarPropertySolverTab:
         except Exception as e:
             self.log(f"    {label}Nastran run error: {e}")
             return False
+        finally:
+            # Scratch files are pure intermediates, never needed once the run is
+            # done - clean up our own temp scratch dir so a long sweep doesn't
+            # fill the scratch disk.
+            if made_temp_scratch and os.path.isdir(run_scratch_dir):
+                shutil.rmtree(run_scratch_dir, ignore_errors=True)
 
     def _wait_for_op2(self, bdf_path, folder, timeout=3600, poll_interval=5, stable_checks=3, label=""):
         """Poll for <bdf-basename>.op2 in folder to appear and its file size to
