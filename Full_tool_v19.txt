@@ -1279,9 +1279,10 @@ class BarPropertySolverTab:
         self.bar_structure_map = {}       # PID -> Structure Name
         self.structure_groups = {}        # Structure Name -> [PID list]
         self.pbarl_dims = {}              # PID -> {'dim1': val, 'dim2': val} from BDF
-        self.current_bar_thicknesses = {} # PID -> base thickness (used when building/offsetting the base model)
+        self.current_bar_thicknesses = {} # PID -> base thickness (from load_properties)
         self.current_skin_thicknesses = {}# PID -> effective thickness (Excel 'Skin Property' if given, else BDF), for base model + offsets
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
+        self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
         self.material_densities = {}      # MID -> density
         self.prop_to_material = {}        # PID -> MID
         self.element_areas = {}
@@ -2061,42 +2062,40 @@ class BarPropertySolverTab:
         return output_bdf
 
     def _build_base_model(self, run_folder):
-        """Apply the Excel base Bar/Skin properties to every loaded BDF and the
-        maneuver BDF, then apply offsets ONCE using the base maneuver BDF as the
-        geometry source. The resulting files (bdf_info['base_path']) are the fixed
-        starting point every sweep iteration writes its active group's thickness
-        onto - offsets are not recomputed per iteration."""
+        """Apply the Excel base Bar/Skin properties to every loaded BDF and to
+        the maneuver (offset source) BDF. These base files carry ONLY the
+        Excel properties - no offsets. Offsets are computed and applied fresh
+        for every iteration (baseline included) by _prepare_iteration_bdfs,
+        since they depend on the maneuver BDF's geometry at that iteration's
+        thickness, not on some value frozen once up front."""
         base_folder = os.path.join(run_folder, "_base_model")
         os.makedirs(base_folder, exist_ok=True)
 
         self.log("\n" + "=" * 70)
-        self.log("BUILDING BASE MODEL (Excel Bar/Skin Property thicknesses + offsets)")
+        self.log("BUILDING BASE MODEL (Excel Bar/Skin Property thicknesses)")
         self.log("=" * 70)
 
-        base_maneuver_path = None
+        self.maneuver_base_path = None
         if self.maneuver_bdfs:
             man_folder = os.path.join(base_folder, "maneuver")
             os.makedirs(man_folder, exist_ok=True)
-            base_maneuver_path = self._apply_excel_properties(self.maneuver_bdfs[0], man_folder)
-            self.log(f"  Base maneuver BDF ready: {os.path.basename(base_maneuver_path)}")
+            self.maneuver_base_path = self._apply_excel_properties(self.maneuver_bdfs[0], man_folder)
+            self.log(f"  Base maneuver (offset source) BDF ready: {os.path.basename(self.maneuver_base_path)}")
         else:
-            self.log("  No maneuver BDF provided - offsets will use each thermal BDF's own geometry.")
+            self.log("  No maneuver BDF provided - no offsets will be computed.")
 
         for bdf_idx, bdf_info in enumerate(self.bdf_models):
             bdf_folder = os.path.join(base_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_info['name'])[0]}")
             os.makedirs(bdf_folder, exist_ok=True)
-
             base_path = self._apply_excel_properties(bdf_info['path'], bdf_folder)
-
-            if base_maneuver_path or self.landing_elem_ids or self.bar_offset_elem_ids:
-                base_path = self._apply_offsets(base_path, bdf_folder, base_maneuver_path)
-
             bdf_info['base_path'] = base_path
             self.log(f"  Base model ready for {bdf_info['name']}: {os.path.basename(base_path)}")
 
         # Run Nastran + extract/combine stresses on the base model itself too, so
         # there is a real baseline result (Excel thicknesses, no group swept yet)
-        # to compare every sweep step against - not just a geometry/offset step.
+        # to compare every sweep step against. thickness_overrides={} means every
+        # PID uses its self.bar_properties base value - offsets get computed
+        # fresh from the maneuver BDF at that same base thickness.
         self.log("\n  Running Nastran + stress extraction on the BASE MODEL (baseline, before any sweep)...")
         base_stresses, base_combined = self._run_single_iteration(base_folder, {}, label="[BASE] ")
         self.base_stresses = base_stresses
@@ -2113,27 +2112,36 @@ class BarPropertySolverTab:
 
         self.log("BASE MODEL READY - sweep will now vary each group's bar thickness on top of it.\n")
 
-    # ==================== OFFSET APPLICATION ====================
-    def _apply_offsets(self, bdf_path, folder, maneuver_bdf_path=None):
+    # ==================== OFFSET CALCULATION / APPLICATION ====================
+    def _calculate_offset_csv(self, thickness_overrides, folder, label=""):
+        """Write the maneuver (offset source) BDF at THIS iteration's
+        thickness_overrides (layered on its Excel-properties base, same as any
+        other BDF), then compute landing/bar offsets from that freshly-written
+        geometry and save them to offsets.csv in `folder`. Called once per
+        iteration (sweep step or baseline) - not once for the whole sweep -
+        since the maneuver geometry (and therefore the offsets) changes with
+        whichever group's thickness is being tested. Returns the CSV path, or
+        None if there's no maneuver BDF or no offset elements configured."""
+        if not self.maneuver_base_path:
+            return None
         if not self.landing_elem_ids and not self.bar_offset_elem_ids:
-            self.log("    No offset elements defined, skipping")
-            return bdf_path
+            return None
+
+        man_folder = os.path.join(folder, "maneuver_for_offset")
+        os.makedirs(man_folder, exist_ok=True)
+        maneuver_path = self._write_bdf_for_model(man_folder, None, self.maneuver_base_path, thickness_overrides)
 
         try:
-            # Use UPDATED maneuver BDF for offset geometry if provided
-            if maneuver_bdf_path:
-                geom_path = maneuver_bdf_path
-                self.log(f"    Using UPDATED maneuver BDF for offsets: {os.path.basename(geom_path)}")
-            else:
-                geom_path = bdf_path
-                self.log(f"    Using working BDF for offset geometry")
-            self.log(f"    Applying offsets...")
             bdf = BDF(debug=False)
-            bdf.read_bdf(geom_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+            bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+        except Exception as e:
+            self.log(f"    {label}Offset calc error reading maneuver BDF: {e}")
+            return None
 
+        try:
             # Landing (shell) offsets: zoffset = -t/2
-            landing_offsets = {}
             landing_normals = {}
+            rows = []
 
             for eid in self.landing_elem_ids:
                 if eid not in bdf.elements:
@@ -2145,46 +2153,45 @@ class BarPropertySolverTab:
 
                 t = self.current_skin_thicknesses.get(pid, 3.0)
                 t = max(0.1, t)
-                landing_offsets[eid] = -t / 2.0
+                zoffset = -t / 2.0
 
+                normal = None
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     try:
                         nids = elem.node_ids[:3]
                         nodes = [bdf.nodes[n] for n in nids if n in bdf.nodes]
                         if len(nodes) >= 3:
                             p1, p2, p3 = [np.array(n.get_position()) for n in nodes]
-                            normal = np.cross(p2 - p1, p3 - p1)
-                            nl = np.linalg.norm(normal)
+                            nvec = np.cross(p2 - p1, p3 - p1)
+                            nl = np.linalg.norm(nvec)
                             if nl > 1e-10:
-                                landing_normals[eid] = normal / nl
-                    except:
+                                normal = nvec / nl
+                    except Exception:
                         pass
-
-            self.log(f"    Landing offsets: {len(landing_offsets)} elements")
+                landing_normals[eid] = normal
+                rows.append({'Type': 'Landing', 'Element': eid, 'ZOffset': zoffset,
+                             'WA_X': '', 'WA_Y': '', 'WA_Z': ''})
 
             # Node -> shell mapping for bar offset
             node_to_shells = {}
             for eid, elem in bdf.elements.items():
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     for nid in elem.node_ids:
-                        if nid not in node_to_shells:
-                            node_to_shells[nid] = []
-                        node_to_shells[nid].append(eid)
+                        node_to_shells.setdefault(nid, []).append(eid)
 
             # Bar offsets: WA = WB = -normal * (landing_t + bar_t/2)
-            bar_offsets = {}
+            bar_min = float(self.bar_min_thickness.get())
             for eid in self.bar_offset_elem_ids:
                 if eid not in bdf.elements:
                     continue
                 elem = bdf.elements[eid]
                 if elem.type not in ['CBAR', 'CBEAM']:
                     continue
-
                 pid = elem.pid if hasattr(elem, 'pid') else None
                 if pid is None:
                     continue
 
-                bar_t = self.current_bar_thicknesses.get(pid, float(self.bar_min_thickness.get()))
+                bar_t = thickness_overrides.get(pid, self.bar_properties.get(pid, {}).get('dim1', bar_min))
                 bar_t = max(0.1, bar_t)
 
                 bar_nodes = elem.node_ids[:2]
@@ -2192,25 +2199,58 @@ class BarPropertySolverTab:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
                     max_t = 0
                     best_normal = None
-
                     for shell_eid in common:
-                        if shell_eid in landing_offsets:
+                        if shell_eid in landing_normals:
                             shell_elem = bdf.elements[shell_eid]
                             shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                             if shell_pid:
                                 shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
                                 if shell_t > max_t:
                                     max_t = shell_t
-                                    if shell_eid in landing_normals:
-                                        best_normal = landing_normals[shell_eid]
+                                    best_normal = landing_normals.get(shell_eid)
 
                     if best_normal is not None and max_t > 0:
                         offset_mag = max_t + bar_t / 2.0
-                        bar_offsets[eid] = tuple(-best_normal * offset_mag)
+                        vec = -best_normal * offset_mag
+                        rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
+                                     'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})
 
-            self.log(f"    Bar offsets: {len(bar_offsets)} elements")
+            if not rows:
+                return None
 
-            # Apply to BDF file
+            n_landing = sum(1 for r in rows if r['Type'] == 'Landing')
+            n_bar = sum(1 for r in rows if r['Type'] == 'Bar')
+            csv_path = os.path.join(folder, 'offsets.csv')
+            with open(csv_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z'])
+                w.writeheader()
+                w.writerows(rows)
+            self.log(f"    {label}Offset CSV: {n_landing} landing, {n_bar} bar -> {csv_path}")
+            return csv_path
+
+        except Exception as e:
+            self.log(f"    {label}Offset calc error: {e}")
+            return None
+
+    def _apply_offsets_from_csv(self, bdf_path, csv_path, folder, label=""):
+        """Read an offsets.csv (from _calculate_offset_csv) and write a copy of
+        bdf_path with those ZOFFSET/WA-WB values applied, saved as
+        <name>_offseted.bdf in `folder`."""
+        landing_offsets = {}
+        bar_offsets = {}
+        try:
+            with open(csv_path, 'r', newline='') as f:
+                for row in csv.DictReader(f):
+                    eid = int(row['Element'])
+                    if row['Type'] == 'Landing':
+                        landing_offsets[eid] = float(row['ZOffset'])
+                    elif row['Type'] == 'Bar':
+                        bar_offsets[eid] = (float(row['WA_X']), float(row['WA_Y']), float(row['WA_Z']))
+        except Exception as e:
+            self.log(f"    {label}Could not read offsets CSV: {e}")
+            return bdf_path
+
+        try:
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
@@ -2231,8 +2271,7 @@ class BarPropertySolverTab:
                         eid = int(line[8:16].strip())
                         if eid in landing_offsets:
                             padded = line.rstrip().ljust(72)
-                            new_line = padded[:64] + fmt(landing_offsets[eid]) + '\n'
-                            new_lines.append(new_line)
+                            new_lines.append(padded[:64] + fmt(landing_offsets[eid]) + '\n')
                             applied_landing += 1
                             i += 1
                             continue
@@ -2244,8 +2283,7 @@ class BarPropertySolverTab:
                         eid = int(line[8:16].strip())
                         if eid in landing_offsets:
                             padded = line.rstrip().ljust(56)
-                            new_line = padded[:48] + fmt(landing_offsets[eid]) + '\n'
-                            new_lines.append(new_line)
+                            new_lines.append(padded[:48] + fmt(landing_offsets[eid]) + '\n')
                             applied_landing += 1
                             i += 1
                             continue
@@ -2304,18 +2342,41 @@ class BarPropertySolverTab:
                 new_lines.append(line)
                 i += 1
 
-            # Write as _offseted.bdf
-            base, ext = os.path.splitext(bdf_path)
-            output_bdf = base + "_offseted" + ext
+            base, ext = os.path.splitext(os.path.basename(bdf_path))
+            output_bdf = os.path.join(folder, base + "_offseted" + ext)
             with open(output_bdf, 'w', encoding='latin-1') as f:
                 f.writelines(new_lines)
 
-            self.log(f"    Offsets applied: {applied_landing} landing, {applied_bar} bar")
+            self.log(f"    {label}Offsets applied from CSV: {applied_landing} landing, {applied_bar} bar")
             return output_bdf
 
         except Exception as e:
-            self.log(f"    Offset error: {e}")
+            self.log(f"    {label}Offset apply error: {e}")
             return bdf_path
+
+    def _prepare_iteration_bdfs(self, iter_folder, thickness_overrides, label=""):
+        """Write every bdf_model's BDF at thickness_overrides (layered on its
+        Excel-properties base), compute a FRESH offsets.csv from the maneuver
+        (source) BDF at this same thickness_overrides, and apply those offsets
+        to every written BDF. Used for both the baseline run and every sweep
+        iteration, so offsets are always recomputed from the current thickness
+        - never frozen from a one-time base-model calculation. Returns a list
+        of {'name', 'subfolder', 'bdf_path', 'run_ok'} dicts, one per bdf_model."""
+        n_bdfs = len(self.bdf_models) if self.bdf_models else 1
+
+        offset_csv = self._calculate_offset_csv(thickness_overrides, iter_folder, label=label)
+
+        per_bdf = []
+        for bdf_idx, bdf_info in enumerate(self.bdf_models):
+            bdf_name = bdf_info['name']
+            bdf_subfolder = os.path.join(iter_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else iter_folder
+            os.makedirs(bdf_subfolder, exist_ok=True)
+            base_source = bdf_info.get('base_path', bdf_info['path'])
+            bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source, thickness_overrides)
+            if offset_csv:
+                bdf_path = self._apply_offsets_from_csv(bdf_path, offset_csv, bdf_subfolder, label=label)
+            per_bdf.append({'name': bdf_name, 'subfolder': bdf_subfolder, 'bdf_path': bdf_path, 'run_ok': False})
+        return per_bdf
 
     # ==================== NASTRAN EXECUTION ====================
     def _run_nastran(self, bdf_path, folder, label=""):
@@ -2683,41 +2744,35 @@ class BarPropertySolverTab:
 
     # ==================== SINGLE THICKNESS ITERATION ====================
     def _run_single_iteration(self, folder, thickness_overrides, label=""):
-        """Run Nastran for thickness_overrides (layered on the pre-built base
-        model) and extract stresses. thickness_overrides is {} for the base
-        model's own baseline run. The base model (Excel Bar/Skin properties +
-        offsets) is built once per sweep in _build_base_model - offsets are not
-        recomputed here. Takes thickness_overrides as an explicit argument
-        (rather than reading shared instance state) so this can safely be
-        called from multiple threads at once for different thickness values."""
+        """Write every BDF + fresh offsets for thickness_overrides, run Nastran,
+        and extract stresses. thickness_overrides is {} for the base model's
+        own baseline run. Offsets are recomputed here every call (see
+        _prepare_iteration_bdfs / _calculate_offset_csv) from the maneuver BDF
+        at this same thickness_overrides - never frozen from a one-time
+        calculation. Takes thickness_overrides as an explicit argument (rather
+        than reading shared instance state) so this can safely be called from
+        multiple threads at once for different thickness values."""
         try:
-            n_bdfs = len(self.bdf_models) if self.bdf_models else 1
+            per_bdf = self._prepare_iteration_bdfs(folder, thickness_overrides, label=label)
+            n_bdfs = len(per_bdf)
             all_stresses = []
             any_run_ok = False
 
-            for bdf_idx, bdf_info in enumerate(self.bdf_models):
-                bdf_name = bdf_info['name']
-                bdf_subfolder = os.path.join(folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else folder
-                os.makedirs(bdf_subfolder, exist_ok=True)
-
+            for pb in per_bdf:
                 if n_bdfs > 1:
-                    self.log(f"    {label}--- BDF {bdf_idx + 1}/{n_bdfs}: {bdf_name} ---")
+                    self.log(f"    {label}--- BDF: {pb['name']} ---")
 
-                # 1. Write the active group's bar thickness on top of the base model
-                base_source = bdf_info.get('base_path', bdf_info['path'])
-                bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source, thickness_overrides)
-
-                # 2. Run Nastran (offsets already applied once on the base model) and
-                #    WAIT for it to actually finish (incl. the .op2 being fully written)
+                # Run Nastran and WAIT for it to actually finish (incl. the
+                # .op2 being fully written)
                 self.log(f"    {label}Running Nastran...")
-                ok = self._run_nastran(bdf_path, bdf_subfolder, label=label)
+                ok = self._run_nastran(pb['bdf_path'], pb['subfolder'], label=label)
                 if not ok:
-                    self.log(f"    {label}Nastran run failed/incomplete for {bdf_name} - skipping stress extraction for it")
+                    self.log(f"    {label}Nastran run failed/incomplete for {pb['name']} - skipping stress extraction for it")
                     continue
                 any_run_ok = True
 
-                # 3. Extract stresses (only once the run above is confirmed done)
-                stresses = self._extract_stresses(bdf_subfolder, thickness_overrides)
+                # Extract stresses (only once the run above is confirmed done)
+                stresses = self._extract_stresses(pb['subfolder'], thickness_overrides)
                 all_stresses.extend(stresses)
 
                 if stresses:
@@ -2825,12 +2880,14 @@ class BarPropertySolverTab:
 
                 n_bdfs = len(self.bdf_models) if self.bdf_models else 1
 
-                # ---- Phase 1/3: write every BDF for every thickness up front ----
-                # Doing all the (cheap, CPU-only) file writing before any Nastran
-                # run starts makes it possible to see exactly how many jobs exist
-                # before anything is launched, instead of writing being
-                # interleaved with running inside each worker.
-                self.log(f"\n  Phase 1/3 ({struct_name}): writing BDFs for {len(thicknesses)} thickness value(s)...")
+                # ---- Phase 1/3: write every BDF + fresh offsets for every ----
+                # thickness up front. Doing all the (cheap, CPU-only) writing
+                # before any Nastran run starts makes it possible to see
+                # exactly how many jobs exist before anything is launched.
+                # Offsets are recomputed from the maneuver BDF at EACH
+                # thickness here (via _prepare_iteration_bdfs), not reused
+                # from a single base-model calculation - see _calculate_offset_csv.
+                self.log(f"\n  Phase 1/3 ({struct_name}): writing BDFs + offsets for {len(thicknesses)} thickness value(s)...")
                 prepared = []
                 for t_idx, thickness in enumerate(thicknesses):
                     if not self.is_running:
@@ -2838,15 +2895,9 @@ class BarPropertySolverTab:
                     thickness_overrides = {pid: thickness for pid in pids}
                     iter_folder = os.path.join(group_folder, f"t_{thickness:.2f}")
                     os.makedirs(iter_folder, exist_ok=True)
+                    label_prefix = f"[{struct_name} t={thickness:.2f}] "
 
-                    per_bdf = []
-                    for bdf_idx, bdf_info in enumerate(self.bdf_models):
-                        bdf_name = bdf_info['name']
-                        bdf_subfolder = os.path.join(iter_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else iter_folder
-                        os.makedirs(bdf_subfolder, exist_ok=True)
-                        base_source = bdf_info.get('base_path', bdf_info['path'])
-                        bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source, thickness_overrides)
-                        per_bdf.append({'name': bdf_name, 'subfolder': bdf_subfolder, 'bdf_path': bdf_path, 'run_ok': False})
+                    per_bdf = self._prepare_iteration_bdfs(iter_folder, thickness_overrides, label=label_prefix)
 
                     prepared.append({
                         't_idx': t_idx, 'thickness': thickness, 'iter_folder': iter_folder,
