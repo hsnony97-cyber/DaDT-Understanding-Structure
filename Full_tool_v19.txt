@@ -2409,38 +2409,60 @@ class BarPropertySolverTab:
         return ", ".join(parts) if parts else "no output files found yet in any watched folder"
 
     def _wait_for_op2(self, bdf_path, folder, scratch_dir=None, timeout=3600, poll_interval=5,
-                       stable_checks=3, heartbeat_every=30, label=""):
-        """Poll for <bdf-basename>.op2 to appear and its file size to stop
-        changing for `stable_checks` consecutive polls, since the run process
-        exiting is not a reliable "solve finished" signal for every Nastran
-        launcher. Checks both `folder` (the out= target) and `scratch_dir` (in
-        case this Nastran install actually writes results there instead), and
-        logs a heartbeat every `heartbeat_every` seconds with whatever output
-        files it currently sees, so a long or failed solve is visible instead
-        of the tool looking frozen with no feedback at all."""
+                       heartbeat_every=30, label=""):
+        """Poll until Nastran has genuinely finished this run.
+
+        This used to declare "done" once the .op2 file's size stopped
+        changing for 3 polls (15s). On a large model that's wrong: Nastran
+        can go minutes with no bytes written to the .op2 during assembly/
+        decomposition, long before the run is actually done - so that
+        heuristic returned True while the real solve (and the detached
+        "analysis" process behind it) kept running in the background. The
+        tool then read a still-incomplete .op2 (empty/garbage results) AND
+        freed its worker slot early, letting more jobs start than Max
+        Parallel Runs was supposed to allow.
+
+        The reliable signal is Nastran's own .f06 log: it contains "FATAL"
+        on failure and "END OF JOB" once a run has genuinely completed,
+        written only when the solve itself is done - not when some
+        launcher process happens to exit. Only if no .f06 ever appears at
+        all (a different install's behavior) does this fall back to a much
+        longer op2-size-stability window (minutes, not seconds) as a last
+        resort.
+        """
         base = os.path.splitext(os.path.basename(bdf_path))[0]
-        search_dirs = [folder] + ([scratch_dir] if scratch_dir and scratch_dir != folder else [])
+        f06_path = os.path.join(folder, base + '.f06')
+        op2_search_dirs = [folder] + ([scratch_dir] if scratch_dir and scratch_dir != folder else [])
         start = time.time()
-        last_size = -1
-        stable = 0
         last_heartbeat = 0.0
+        last_size = -1
+        stable_since = None
+        fallback_stable_seconds = 180
+
+        def _find_op2():
+            for d in op2_search_dirs:
+                candidate = os.path.join(d, base + '.op2')
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    return d, candidate
+            return None, None
 
         while time.time() - start < timeout:
             elapsed = time.time() - start
-            op2_path = None
-            op2_dir = None
-            for d in search_dirs:
-                candidate = os.path.join(d, base + '.op2')
-                if os.path.exists(candidate):
-                    op2_path = candidate
-                    op2_dir = d
-                    break
 
-            if op2_path:
-                size = os.path.getsize(op2_path)
-                if size > 0 and size == last_size:
-                    stable += 1
-                    if stable >= stable_checks:
+            if os.path.exists(f06_path):
+                try:
+                    with open(f06_path, 'r', errors='ignore') as f:
+                        tail = f.read()[-8000:].upper()
+                except OSError:
+                    tail = ''
+
+                if 'FATAL' in tail:
+                    self.log(f"    {label}Nastran reported a FATAL error - see {f06_path}")
+                    return False
+
+                if 'END OF JOB' in tail:
+                    op2_dir, op2_path = _find_op2()
+                    if op2_path:
                         if op2_dir != folder:
                             self.log(f"    {label}NOTE: .op2 appeared in {op2_dir} (not the out= folder) - copying it to {folder}")
                             try:
@@ -2448,28 +2470,33 @@ class BarPropertySolverTab:
                             except Exception as e:
                                 self.log(f"    {label}WARNING: could not copy .op2 into {folder}: {e}")
                         return True
-                else:
-                    stable = 0
-                last_size = size
+                    # F06 says the job is over but the .op2 hasn't shown up
+                    # yet - keep polling a little longer rather than failing.
+            else:
+                # No .f06 at all for this install/config - fall back to a
+                # long op2 size-stability window instead of failing outright.
+                _, op2_path = _find_op2()
+                if op2_path:
+                    size = os.path.getsize(op2_path)
+                    if size == last_size:
+                        if stable_since is None:
+                            stable_since = time.time()
+                        elif time.time() - stable_since >= fallback_stable_seconds:
+                            return True
+                    else:
+                        stable_since = None
+                    last_size = size
 
             if elapsed - last_heartbeat >= heartbeat_every:
                 last_heartbeat = elapsed
                 self.log(f"    {label}...still waiting for Nastran ({int(elapsed)}s elapsed): "
-                          f"{self._describe_run_progress(search_dirs, base)}")
+                          f"{self._describe_run_progress([folder] + op2_search_dirs, base)}")
 
             time.sleep(poll_interval)
 
-        self.log(f"    {label}WARNING: timed out after {timeout}s waiting for {base}.op2")
-        for d in search_dirs:
-            candidate = os.path.join(d, base + '.op2')
-            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                if d != folder:
-                    try:
-                        shutil.copy2(candidate, os.path.join(folder, base + '.op2'))
-                    except Exception:
-                        pass
-                return True
-        return False
+        self.log(f"    {label}WARNING: timed out after {timeout}s waiting for {base} to finish")
+        _, op2_path = _find_op2()
+        return op2_path is not None
 
     # ==================== STRESS EXTRACTION ====================
     def _extract_stresses(self, folder, thickness_overrides):
