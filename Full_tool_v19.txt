@@ -1410,9 +1410,9 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
         scr_hint = ttk.Frame(f1)
         scr_hint.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - each Nastran run gets its own "
-                                  "unique scratch subfolder here, so parallel runs never collide; "
-                                  "blank = each run's own output folder)",
+        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - blank = unchanged default behavior. "
+                                  "If set, adds sdirectory= to the Nastran command so parallel runs never "
+                                  "collide - test with 1 run first, since not every Nastran install accepts it)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output Folder
@@ -2325,20 +2325,25 @@ class BarPropertySolverTab:
             return False
 
         # Give this run its own scratch subdirectory so concurrent runs (when
-        # Max Parallel Runs > 1) never share/collide on scratch files. If the
-        # user set a Scratch Folder, put it there (e.g. a fast local disk);
-        # otherwise fall back to this run's own output folder, which is
-        # already unique per iteration.
+        # Max Parallel Runs > 1) never share/collide on scratch files - but
+        # ONLY if the user actually set a Scratch Folder. Leaving it blank
+        # must reproduce the exact command line this tool always used
+        # (no sdirectory= at all): adding that keyword unconditionally
+        # (even pointed at each run's own already-unique output folder)
+        # was found to hang some Nastran installations indefinitely with
+        # no solver window ever appearing, since it's a new, never-before-
+        # used argument for those installs.
         scratch_base = self.scratch_folder.get().strip()
-        run_scratch_dir = folder
+        run_scratch_dir = None
         made_temp_scratch = False
         try:
+            cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes batch=no'
             if scratch_base:
                 os.makedirs(scratch_base, exist_ok=True)
                 run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
                 made_temp_scratch = True
+                cmd += f' sdirectory="{run_scratch_dir}"'
 
-            cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes sdirectory="{run_scratch_dir}" batch=no'
             mem = self.nastran_memory.get().strip()
             if mem:
                 cmd += f' mem={mem}'
