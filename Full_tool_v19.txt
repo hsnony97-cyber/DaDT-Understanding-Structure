@@ -1410,10 +1410,9 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
         scr_hint = ttk.Frame(f1)
         scr_hint.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - blank = unchanged default behavior. "
-                                  "If set, each run's BDF is copied into its own subfolder here before "
-                                  "solving - whether that actually redirects Nastran's own scratch files "
-                                  "depends on your install, so check the folder fills up as expected)",
+        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - blank = Nastran runs with cwd on its "
+                                  "own output folder. If set, each run gets its own subfolder here as its "
+                                  "working directory instead, so parallel runs never share scratch space)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output Folder
@@ -2325,24 +2324,18 @@ class BarPropertySolverTab:
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
 
-        # Give this run its own scratch subdirectory so concurrent runs (when
-        # Max Parallel Runs > 1) never share/collide on scratch files - but
-        # ONLY if the user actually set a Scratch Folder. Leaving it blank
-        # must reproduce the exact command line this tool always used.
-        #
-        # NOTE: an earlier version of this added `sdirectory="<dir>"` to the
-        # command line. That new keyword hung one real Nastran install with
-        # no output at all (not even in the scratch dir itself), and on a
-        # second install it ran but wrote nothing anywhere either - so it's
-        # not a keyword every Nastran distribution here accepts. Instead of
-        # relying on a scratch-directory keyword at all, copy the BDF into
-        # the isolated scratch folder and run Nastran on THAT copy - this
-        # changes nothing about the command line syntax Nastran sees (still
-        # exactly `nastran "<file>" out="<dir>" scratch=yes batch=no`, just
-        # with a different <file> location), so it can't newly break a
-        # working install the way an unrecognized keyword could.
+        # Two earlier approaches to scratch isolation (an sdirectory= argument,
+        # then copying the BDF into the scratch folder) both ran on top of
+        # `subprocess.Popen(cmd_string, shell=True)`. On real hardware that
+        # produced way more OS processes than Max Parallel Runs allowed and,
+        # separately, a run that opened, touched the scratch folder, and then
+        # looked frozen forever with no error. A known-working sibling tool
+        # (Eray-Tool's nastran_tool.py) runs Nastran a different way: a plain
+        # argument LIST (no shell), and an explicit `cwd=` set to a directory
+        # unique to that run - no shell layer, no scratch keyword needed at
+        # all. Adopt that here: shell=True is gone, and `cwd` (not a new
+        # Nastran command-line keyword) is what isolates concurrent runs.
         scratch_base = self.scratch_folder.get().strip()
-        run_input_path = bdf_path
         run_scratch_dir = None
         made_temp_scratch = False
         try:
@@ -2350,25 +2343,24 @@ class BarPropertySolverTab:
                 os.makedirs(scratch_base, exist_ok=True)
                 run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
                 made_temp_scratch = True
-                run_input_path = os.path.join(run_scratch_dir, os.path.basename(bdf_path))
-                shutil.copy2(bdf_path, run_input_path)
-                self.log(f"    {label}Scratch copy: {run_input_path}")
 
-            cmd = f'"{nastran}" "{run_input_path}" out="{folder}" scratch=yes batch=no'
+            cwd_dir = run_scratch_dir or folder
+
+            cmd = [nastran, bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
             mem = self.nastran_memory.get().strip()
             if mem:
-                cmd += f' mem={mem}'
-            proc = subprocess.Popen(cmd, shell=True)
-            proc.wait()  # block until the launched process actually exits - no artificial timeout
-            returncode = proc.returncode
-            if returncode != 0:
-                self.log(f"    {label}WARNING: Nastran exited with code {returncode}")
+                cmd.append(f"mem={mem}")
 
-            # Some Nastran launchers (notably on Windows) return before the actual
-            # solver they spawned has finished writing output. Don't trust process
-            # exit alone - wait for the .op2 to appear and stop growing. bdf_path's
-            # basename is used (not run_input_path's) but they're identical since
-            # the copy above preserves the original filename.
+            result = subprocess.run(cmd, cwd=cwd_dir, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
+                if result.stderr:
+                    self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
+
+            # subprocess.run() (no shell=True) blocks until Nastran itself has
+            # actually exited, unlike the earlier shell=True + Popen().wait()
+            # combination. Still confirm the .op2 as a safety net in case some
+            # install's launcher detaches a child process anyway.
             if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
                 self.log(f"    {label}WARNING: .op2 never appeared/finished writing - treating run as failed")
                 return False
