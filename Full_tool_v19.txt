@@ -1410,9 +1410,9 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
         scr_hint = ttk.Frame(f1)
         scr_hint.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - blank = Nastran runs with cwd on its "
-                                  "own output folder. If set, each run gets its own subfolder here as its "
-                                  "working directory instead, so parallel runs never share scratch space)",
+        ttk.Label(scr_hint, text="(recommended if C: is low on space - blank = Nastran uses its own default "
+                                  "temp location. If set, each run gets its own subfolder here, set as that "
+                                  "run's TEMP/TMP, so scratch never lands on C: or collides between runs)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output Folder
@@ -2324,25 +2324,32 @@ class BarPropertySolverTab:
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
 
-        # Two earlier approaches to scratch isolation (an sdirectory= argument,
-        # then copying the BDF into the scratch folder) both ran on top of
-        # `subprocess.Popen(cmd_string, shell=True)`. On real hardware that
-        # produced way more OS processes than Max Parallel Runs allowed and,
-        # separately, a run that opened, touched the scratch folder, and then
-        # looked frozen forever with no error. A known-working sibling tool
-        # (Eray-Tool's nastran_tool.py) runs Nastran a different way: a plain
-        # argument LIST (no shell), and an explicit `cwd=` set to a directory
-        # unique to that run - no shell layer, no scratch keyword needed at
-        # all. Adopt that here: shell=True is gone, and `cwd` (not a new
-        # Nastran command-line keyword) is what isolates concurrent runs.
+        # Neither of the two earlier approaches to scratch isolation actually
+        # redirected where Nastran puts its scratch files. Confirmed on real
+        # hardware: with a Scratch Folder configured, a run FATAL-errored with
+        # "There is not enough space on the disk", and the offending scratch
+        # file was sitting in C:\Users\<user>\AppData\Local\Temp\<n>\ - the
+        # plain Windows per-process temp folder, completely ignoring both the
+        # sdirectory= argument and cwd= that were tried before. That path
+        # shape is exactly what Windows' GetTempPath() returns, which reads
+        # the TMP/TEMP environment variables - so Nastran's scratch placement
+        # here follows those variables, not argv or the process cwd. Override
+        # them for this subprocess only (not the whole session) so its
+        # scratch lands in the chosen Scratch Folder instead of the system
+        # C: temp drive, without touching any other process on the machine.
         scratch_base = self.scratch_folder.get().strip()
         run_scratch_dir = None
         made_temp_scratch = False
         try:
+            env = None
             if scratch_base:
                 os.makedirs(scratch_base, exist_ok=True)
                 run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
                 made_temp_scratch = True
+                env = os.environ.copy()
+                env['TEMP'] = run_scratch_dir
+                env['TMP'] = run_scratch_dir
+                self.log(f"    {label}Scratch dir (via TEMP/TMP): {run_scratch_dir}")
 
             cwd_dir = run_scratch_dir or folder
 
@@ -2351,11 +2358,19 @@ class BarPropertySolverTab:
             if mem:
                 cmd.append(f"mem={mem}")
 
-            result = subprocess.run(cmd, cwd=cwd_dir, capture_output=True, text=True)
+            result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
             if result.returncode != 0:
                 self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
                 if result.stderr:
                     self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
+
+            if made_temp_scratch:
+                scratch_files = os.listdir(run_scratch_dir)
+                if scratch_files:
+                    self.log(f"    {label}Scratch folder in use: {len(scratch_files)} file(s) in {run_scratch_dir}")
+                else:
+                    self.log(f"    {label}WARNING: Scratch folder is still empty - Nastran likely used its "
+                              f"own default temp location instead of {run_scratch_dir}")
 
             # subprocess.run() (no shell=True) blocks until Nastran itself has
             # actually exited, unlike the earlier shell=True + Popen().wait()
@@ -2778,60 +2793,115 @@ class BarPropertySolverTab:
                 group_folder = os.path.join(run_folder, struct_name)
                 os.makedirs(group_folder, exist_ok=True)
 
-                group_results_by_idx = [None] * len(thicknesses)
+                n_bdfs = len(self.bdf_models) if self.bdf_models else 1
+
+                # ---- Phase 1/3: write every BDF for every thickness up front ----
+                # Doing all the (cheap, CPU-only) file writing before any Nastran
+                # run starts makes it possible to see exactly how many jobs exist
+                # before anything is launched, instead of writing being
+                # interleaved with running inside each worker.
+                self.log(f"\n  Phase 1/3 ({struct_name}): writing BDFs for {len(thicknesses)} thickness value(s)...")
+                prepared = []
+                for t_idx, thickness in enumerate(thicknesses):
+                    if not self.is_running:
+                        break
+                    thickness_overrides = {pid: thickness for pid in pids}
+                    iter_folder = os.path.join(group_folder, f"t_{thickness:.2f}")
+                    os.makedirs(iter_folder, exist_ok=True)
+
+                    per_bdf = []
+                    for bdf_idx, bdf_info in enumerate(self.bdf_models):
+                        bdf_name = bdf_info['name']
+                        bdf_subfolder = os.path.join(iter_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else iter_folder
+                        os.makedirs(bdf_subfolder, exist_ok=True)
+                        base_source = bdf_info.get('base_path', bdf_info['path'])
+                        bdf_path = self._write_bdf_for_model(bdf_subfolder, bdf_info['model'], base_source, thickness_overrides)
+                        per_bdf.append({'name': bdf_name, 'subfolder': bdf_subfolder, 'bdf_path': bdf_path, 'run_ok': False})
+
+                    prepared.append({
+                        't_idx': t_idx, 'thickness': thickness, 'iter_folder': iter_folder,
+                        'thickness_overrides': thickness_overrides, 'per_bdf': per_bdf,
+                    })
+                self.log(f"  Phase 1 done: {len(prepared)} thickness set(s), {len(prepared) * n_bdfs} BDF file(s) written.")
+
+                # ---- Phase 2/3: run Nastran for every (thickness, bdf) job, ----
+                # capped at Max Parallel Runs. Flattening thicknesses and BDFs
+                # into one job list (instead of one pool per thickness, each
+                # internally running its 2 BDFs one at a time) means max_parallel
+                # is a direct, exact cap on concurrent Nastran processes.
+                run_jobs = [(p, pb) for p in prepared for pb in p['per_bdf']]
+                self.log(f"\n  Phase 2/3 ({struct_name}): running Nastran for {len(run_jobs)} job(s), "
+                          f"max {max_parallel} at a time...")
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                    future_to_meta = {}
-                    for t_idx, thickness in enumerate(thicknesses):
-                        if not self.is_running:
-                            break
+                    future_to_job = {}
+                    for p, pb in run_jobs:
+                        label = f"[{struct_name} t={p['thickness']:.2f} {pb['name']}] "
+                        future = executor.submit(self._run_nastran, pb['bdf_path'], pb['subfolder'], label)
+                        future_to_job[future] = (p, pb)
 
-                        label = f"[{struct_name} t={thickness:.2f}] "
-                        thickness_overrides = {pid: thickness for pid in pids}
-
-                        iter_folder = os.path.join(group_folder, f"t_{thickness:.2f}")
-                        os.makedirs(iter_folder, exist_ok=True)
-
-                        self.log(f"\n  --- {struct_name}: submitting t = {thickness:.2f} mm ({t_idx + 1}/{len(thicknesses)}) ---")
-                        future = executor.submit(self._run_single_iteration, iter_folder, thickness_overrides, label)
-                        future_to_meta[future] = (t_idx, thickness)
-
-                    completed = 0
-                    for future in concurrent.futures.as_completed(future_to_meta):
-                        t_idx, thickness = future_to_meta[future]
-                        completed += 1
-                        current_step += 1
-                        progress = (current_step / total_steps) * 100
-                        self.root.after(0, lambda p=progress: self.progress_var.set(p))
-
+                    run_done = 0
+                    for future in concurrent.futures.as_completed(future_to_job):
+                        p, pb = future_to_job[future]
+                        run_done += 1
                         try:
-                            stresses, combined_stresses = future.result()
+                            pb['run_ok'] = future.result()
                         except Exception as e:
-                            self.log(f"    [{struct_name} t={thickness:.2f}] Iteration raised an exception: {e}")
-                            stresses, combined_stresses = [], None
+                            self.log(f"    [{struct_name} t={p['thickness']:.2f} {pb['name']}] "
+                                      f"Nastran run raised an exception: {e}")
+                            pb['run_ok'] = False
+                        self.log(f"  Phase 2: {run_done}/{len(run_jobs)} Nastran run(s) finished "
+                                  f"({'OK' if pb['run_ok'] else 'FAILED'}: t={p['thickness']:.2f} {pb['name']})")
 
-                        self.log(f"\n  --- {struct_name}: t = {thickness:.2f} mm done ({completed}/{len(thicknesses)}) ---")
+                self.log(f"  Phase 2 done.")
 
-                        # Collect stress results for this group's properties
-                        group_stress_data = self._collect_group_stresses(
-                            pids, stresses, combined_stresses
-                        )
+                # ---- Phase 3/3: extract stresses + combine, once all runs are done ----
+                self.log(f"\n  Phase 3/3 ({struct_name}): extracting stresses...")
+                group_results_by_idx = [None] * len(thicknesses)
+                for p in prepared:
+                    if not self.is_running:
+                        break
 
-                        group_results_by_idx[t_idx] = {
-                            'thickness': thickness,
-                            'stresses': group_stress_data,
-                            'raw_stress_count': len(stresses),
-                            'combined_count': len(combined_stresses) if combined_stresses else 0,
-                        }
+                    all_stresses = []
+                    any_ok = False
+                    for pb in p['per_bdf']:
+                        if not pb['run_ok']:
+                            self.log(f"    [t={p['thickness']:.2f}] Skipping extraction for failed run: {pb['bdf_path']}")
+                            continue
+                        any_ok = True
+                        stresses = self._extract_stresses(pb['subfolder'], p['thickness_overrides'])
+                        all_stresses.extend(stresses)
+                        if stresses:
+                            bar_s = [s for s in stresses if s['type'] == 'bar']
+                            shell_s = [s for s in stresses if s['type'] == 'shell']
+                            self.log(f"    [t={p['thickness']:.2f}] Extracted: {len(bar_s)} bar, {len(shell_s)} shell")
 
-                        # Log summary for this thickness
-                        if group_stress_data:
-                            max_stress = max(s['stress'] for s in group_stress_data) if group_stress_data else 0
-                            avg_stress = np.mean([s['stress'] for s in group_stress_data]) if group_stress_data else 0
-                            self.log(f"    Max stress: {max_stress:.2f}, Avg stress: {avg_stress:.2f}")
-                            self.log(f"    Elements in group: {len(group_stress_data)}")
+                    combined_stresses = None
+                    if any_ok and self.residual_strength_df is not None:
+                        combined_stresses = self._combine_stresses_multi(p['iter_folder'], n_bdfs)
+                        if combined_stresses:
+                            self.log(f"    [t={p['thickness']:.2f}] Combined: {len(combined_stresses)} rows")
 
-                # Keep thickness order regardless of which iteration finished first
+                    group_stress_data = self._collect_group_stresses(pids, all_stresses, combined_stresses)
+
+                    group_results_by_idx[p['t_idx']] = {
+                        'thickness': p['thickness'],
+                        'stresses': group_stress_data,
+                        'raw_stress_count': len(all_stresses),
+                        'combined_count': len(combined_stresses) if combined_stresses else 0,
+                    }
+
+                    current_step += 1
+                    progress = (current_step / total_steps) * 100
+                    self.root.after(0, lambda pr=progress: self.progress_var.set(pr))
+
+                    if group_stress_data:
+                        max_stress = max(s['stress'] for s in group_stress_data)
+                        avg_stress = np.mean([s['stress'] for s in group_stress_data])
+                        self.log(f"    t={p['thickness']:.2f}: Max stress: {max_stress:.2f}, "
+                                  f"Avg stress: {avg_stress:.2f}, Elements in group: {len(group_stress_data)}")
+
+                # Keep thickness order regardless of which run finished first
                 group_results = [r for r in group_results_by_idx if r is not None]
                 self.sweep_results[struct_name] = group_results
 
