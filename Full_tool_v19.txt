@@ -1411,8 +1411,9 @@ class BarPropertySolverTab:
         scr_hint = ttk.Frame(f1)
         scr_hint.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(scr_hint, text="(optional, e.g. a local fast disk - blank = unchanged default behavior. "
-                                  "If set, adds sdirectory= to the Nastran command so parallel runs never "
-                                  "collide - test with 1 run first, since not every Nastran install accepts it)",
+                                  "If set, each run's BDF is copied into its own subfolder here before "
+                                  "solving - whether that actually redirects Nastran's own scratch files "
+                                  "depends on your install, so check the folder fills up as expected)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output Folder
@@ -2327,23 +2328,33 @@ class BarPropertySolverTab:
         # Give this run its own scratch subdirectory so concurrent runs (when
         # Max Parallel Runs > 1) never share/collide on scratch files - but
         # ONLY if the user actually set a Scratch Folder. Leaving it blank
-        # must reproduce the exact command line this tool always used
-        # (no sdirectory= at all): adding that keyword unconditionally
-        # (even pointed at each run's own already-unique output folder)
-        # was found to hang some Nastran installations indefinitely with
-        # no solver window ever appearing, since it's a new, never-before-
-        # used argument for those installs.
+        # must reproduce the exact command line this tool always used.
+        #
+        # NOTE: an earlier version of this added `sdirectory="<dir>"` to the
+        # command line. That new keyword hung one real Nastran install with
+        # no output at all (not even in the scratch dir itself), and on a
+        # second install it ran but wrote nothing anywhere either - so it's
+        # not a keyword every Nastran distribution here accepts. Instead of
+        # relying on a scratch-directory keyword at all, copy the BDF into
+        # the isolated scratch folder and run Nastran on THAT copy - this
+        # changes nothing about the command line syntax Nastran sees (still
+        # exactly `nastran "<file>" out="<dir>" scratch=yes batch=no`, just
+        # with a different <file> location), so it can't newly break a
+        # working install the way an unrecognized keyword could.
         scratch_base = self.scratch_folder.get().strip()
+        run_input_path = bdf_path
         run_scratch_dir = None
         made_temp_scratch = False
         try:
-            cmd = f'"{nastran}" "{bdf_path}" out="{folder}" scratch=yes batch=no'
             if scratch_base:
                 os.makedirs(scratch_base, exist_ok=True)
                 run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
                 made_temp_scratch = True
-                cmd += f' sdirectory="{run_scratch_dir}"'
+                run_input_path = os.path.join(run_scratch_dir, os.path.basename(bdf_path))
+                shutil.copy2(bdf_path, run_input_path)
+                self.log(f"    {label}Scratch copy: {run_input_path}")
 
+            cmd = f'"{nastran}" "{run_input_path}" out="{folder}" scratch=yes batch=no'
             mem = self.nastran_memory.get().strip()
             if mem:
                 cmd += f' mem={mem}'
@@ -2355,7 +2366,9 @@ class BarPropertySolverTab:
 
             # Some Nastran launchers (notably on Windows) return before the actual
             # solver they spawned has finished writing output. Don't trust process
-            # exit alone - wait for the .op2 to appear and stop growing.
+            # exit alone - wait for the .op2 to appear and stop growing. bdf_path's
+            # basename is used (not run_input_path's) but they're identical since
+            # the copy above preserves the original filename.
             if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
                 self.log(f"    {label}WARNING: .op2 never appeared/finished writing - treating run as failed")
                 return False
@@ -2367,7 +2380,7 @@ class BarPropertySolverTab:
             # Scratch files are pure intermediates, never needed once the run is
             # done - clean up our own temp scratch dir so a long sweep doesn't
             # fill the scratch disk.
-            if made_temp_scratch and os.path.isdir(run_scratch_dir):
+            if made_temp_scratch and run_scratch_dir and os.path.isdir(run_scratch_dir):
                 shutil.rmtree(run_scratch_dir, ignore_errors=True)
 
     def _describe_run_progress(self, dirs, base):
