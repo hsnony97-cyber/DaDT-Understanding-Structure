@@ -1456,7 +1456,7 @@ class BarPropertySolverTab:
 
         btn_row = ttk.Frame(f3)
         btn_row.pack(fill=tk.X)
-        self.btn_start = ttk.Button(btn_row, text=">>> START SWEEP", command=self.start_sweep)
+        self.btn_start = ttk.Button(btn_row, text=">>> START SWEEP", command=self.start_sweep, state=tk.DISABLED)
         self.btn_start.pack(side=tk.LEFT, padx=5)
         self.btn_stop = ttk.Button(btn_row, text="STOP", command=self.stop_sweep, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
@@ -1843,12 +1843,16 @@ class BarPropertySolverTab:
                 text=f"Loaded: {total} bar props / {groups} groups, {len(self.skin_properties)} skin props",
                 foreground="green"
             )
+            # Excel (structure groups) is what the sweep actually needs - only
+            # enable the sweep button once it's successfully loaded.
+            self.btn_start.config(state=tk.NORMAL if self.structure_groups else tk.DISABLED)
 
         except Exception as e:
             self.log(f"ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
             self.prop_status.config(text="Error", foreground="red")
+            self.btn_start.config(state=tk.DISABLED)
 
     def _update_group_display(self):
         self.group_text.config(state=tk.NORMAL)
