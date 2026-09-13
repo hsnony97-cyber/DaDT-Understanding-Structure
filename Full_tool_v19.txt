@@ -3270,6 +3270,15 @@ class BarPropertySolverTab:
         except Exception as e:
             self.log(f"  Power law fit error: {e}")
 
+    def _classification_percentage_str(self, b_val):
+        """Continuous LOAD/STRAIN split derived from the power-law exponent b.
+        b <= -1 -> 100% load driven (stress ~ 1/thickness, pure F/A behavior);
+        b >= 0  -> 100% strain driven (stress independent of thickness);
+        linear in between. Values outside [-1, 0] are clamped."""
+        pct_load = max(0.0, min(1.0, -b_val)) * 100.0
+        pct_strain = 100.0 - pct_load
+        return f"%{pct_load:.0f} Load / %{pct_strain:.0f} Strain"
+
     def _save_load_strain_summary(self, group_folder, struct_name, group_results):
         """Element-based load/strain driven summary.
         Compares stress at min vs max thickness for each element.
@@ -3360,11 +3369,13 @@ class BarPropertySolverTab:
                         classification = 'STRAIN_DRIVEN'
                     else:
                         classification = 'INCREASING'
+                    classification_pct = self._classification_percentage_str(b_val)
                 else:
                     a_val = ''
                     b_val = ''
                     r2 = ''
                     classification = 'NO_FIT'
+                    classification_pct = ''
 
                 rows.append({
                     'Element_ID': eid,
@@ -3381,6 +3392,7 @@ class BarPropertySolverTab:
                     'Power_b': round(b_val, 4) if isinstance(b_val, float) else '',
                     'R2': round(r2, 6) if isinstance(r2, float) else '',
                     'Classification': classification,
+                    'Classification_Percentage': classification_pct,
                 })
 
             if rows:
@@ -3506,9 +3518,11 @@ class BarPropertySolverTab:
                     row['Power_b'] = round(b_val, 4)
                     row['R2'] = round(r2, 6)
                     row['Classification'] = classify(b_val)
+                    row['Classification_Percentage'] = self._classification_percentage_str(b_val)
                 else:
                     row['Power_a'] = row['Power_b'] = row['R2'] = ''
                     row['Classification'] = 'NO_FIT'
+                    row['Classification_Percentage'] = ''
 
                 rows.append(row)
 
