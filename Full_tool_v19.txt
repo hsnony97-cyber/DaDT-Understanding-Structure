@@ -2034,8 +2034,15 @@ class BarPropertySolverTab:
         an earlier processing stage) would otherwise make this property-only
         step look like it had already applied offsets, and the real offset
         step's own "_offseted" suffix on top of that produced a misleading
-        "..._offseted_offseted" name."""
+        "..._offseted_offseted" name. Any existing trailing "_offseted" on
+        the source's own name is stripped first, so e.g.
+        "merged_maneuver_offseted.bdf" becomes "merged_maneuver_prop_updated.bdf"
+        here and "merged_maneuver_prop_updated_offseted.bdf" once actually
+        offset - not "merged_maneuver_offseted_prop_updated...", which just
+        carries the source's stale suffix along for no reason."""
         base, ext = os.path.splitext(os.path.basename(source_path))
+        if base.endswith('_offseted'):
+            base = base[:-len('_offseted')]
         output_bdf = os.path.join(folder, base + "_prop_updated" + ext)
 
         with open(source_path, 'r', encoding='latin-1') as f:
