@@ -2026,8 +2026,17 @@ class BarPropertySolverTab:
         """Write a copy of source_path with ALL bar Dim1/Dim2 ('Bar Property' sheet)
         and ALL skin thicknesses ('Skin Property' sheet) applied - i.e. every PID,
         not just the active sweep group. This is the base model that the sweep's
-        per-group thickness changes are layered on top of."""
-        output_bdf = os.path.join(folder, os.path.basename(source_path))
+        per-group thickness changes are layered on top of.
+
+        Named "..._prop_updated" (rather than keeping source_path's own name)
+        so it's never confused with the later, actually-offset file - a
+        source file already named "..._offseted.bdf" (e.g. carried over from
+        an earlier processing stage) would otherwise make this property-only
+        step look like it had already applied offsets, and the real offset
+        step's own "_offseted" suffix on top of that produced a misleading
+        "..._offseted_offseted" name."""
+        base, ext = os.path.splitext(os.path.basename(source_path))
+        output_bdf = os.path.join(folder, base + "_prop_updated" + ext)
 
         with open(source_path, 'r', encoding='latin-1') as f:
             lines = f.readlines()
