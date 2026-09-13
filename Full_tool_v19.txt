@@ -3167,6 +3167,9 @@ class BarPropertySolverTab:
                 # Per-case, per-element side-by-side thickness comparison
                 self._save_case_comparison(group_folder, struct_name, group_results, pids)
 
+                # Per-BDF (unit/raw subcase) side-by-side thickness comparison
+                self._save_unit_case_comparison(group_folder, struct_name, group_results, pids)
+
         except Exception as e:
             self.log(f"  Summary save error: {e}")
 
@@ -3536,6 +3539,128 @@ class BarPropertySolverTab:
 
         except Exception as e:
             self.log(f"  Case comparison error: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+    def _save_unit_case_comparison(self, group_folder, struct_name, group_results, pids):
+        """Per-BDF, per-unit-subcase, per-element side-by-side thickness comparison.
+
+        _save_case_comparison compares Combined_LC cases (when Residual Strength
+        combination is configured) or lumps every bdf_model's raw Subcases into
+        one file. This instead always reads each bdf_model's own raw
+        bar_stress_results.csv (never the combined result) and writes one
+        separate CSV per bdf_model - e.g. "..._Maneuver_unit_case_comparison.csv"
+        and "..._Thermal_unit_case_comparison.csv" - so each solved BDF's own
+        unit subcases can be compared side by side across thickness on their
+        own, regardless of whether a combined case is also produced."""
+        try:
+            pid_set = set(pids)
+            if not self.bdf_models:
+                return
+            n_bdfs = len(self.bdf_models)
+
+            thicknesses_sorted = sorted(gr['thickness'] for gr in group_results)
+
+            def power_law_fit(t_arr, s_arr):
+                valid = (t_arr > 0) & (s_arr > 0)
+                t_v, s_v = t_arr[valid], s_arr[valid]
+                if len(t_v) < 2:
+                    return None
+                try:
+                    coeffs = np.polyfit(np.log(t_v), np.log(s_v), 1)
+                    b_val, a_val = coeffs[0], np.exp(coeffs[1])
+                    s_pred = a_val * np.power(t_v, b_val)
+                    ss_res = np.sum((s_v - s_pred) ** 2)
+                    ss_tot = np.sum((s_v - np.mean(s_v)) ** 2)
+                    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+                    return a_val, b_val, r2
+                except Exception:
+                    return None
+
+            def classify(b_val):
+                if b_val <= -0.5:
+                    return 'LOAD_DRIVEN'
+                elif b_val <= -0.1:
+                    return 'PARTIALLY_LOAD'
+                elif b_val <= 0.1:
+                    return 'STRAIN_DRIVEN'
+                return 'INCREASING'
+
+            for bdf_idx, bdf_info in enumerate(self.bdf_models):
+                bdf_name = bdf_info['name']
+                lower_name = bdf_name.lower()
+                if 'thermal' in lower_name:
+                    label = 'Thermal'
+                elif 'maneuver' in lower_name or 'manevra' in lower_name:
+                    label = 'Maneuver'
+                else:
+                    label = os.path.splitext(bdf_name)[0]
+
+                # key -> {thickness: stress}; key = (subcase, element, pid)
+                data = {}
+                for gr in group_results:
+                    t = gr['thickness']
+                    iter_folder = os.path.join(group_folder, f"t_{t:.2f}")
+                    bdf_subfolder = os.path.join(
+                        iter_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}"
+                    ) if n_bdfs > 1 else iter_folder
+                    csv_path = os.path.join(bdf_subfolder, 'bar_stress_results.csv')
+                    if not os.path.exists(csv_path):
+                        continue
+                    try:
+                        df = pd.read_csv(csv_path)
+                    except Exception:
+                        continue
+                    for _, row in df.iterrows():
+                        pid = row.get('Property')
+                        if pd.isna(pid) or int(pid) not in pid_set:
+                            continue
+                        stress_val = row.get('Stress')
+                        if pd.isna(stress_val):
+                            continue
+                        key = (int(row['Subcase']), int(row['Element']), int(pid))
+                        data.setdefault(key, {})[t] = stress_val
+
+                if not data:
+                    self.log(f"  Unit case comparison: no raw subcase data found for {struct_name}/{label}, skipping")
+                    continue
+
+                rows = []
+                for (subcase, eid, pid), t_stress in sorted(data.items()):
+                    row = {'Subcase': subcase, 'Element_ID': eid, 'Property_ID': pid, 'Structure': struct_name}
+
+                    t_arr, s_arr = [], []
+                    for t in thicknesses_sorted:
+                        val = t_stress.get(t, '')
+                        row[f'T_{t:.2f}'] = val
+                        if val != '':
+                            t_arr.append(t)
+                            s_arr.append(val)
+
+                    fit = power_law_fit(np.array(t_arr), np.array(s_arr))
+                    if fit:
+                        a_val, b_val, r2 = fit
+                        row['Power_a'] = round(a_val, 4)
+                        row['Power_b'] = round(b_val, 4)
+                        row['R2'] = round(r2, 6)
+                        row['Classification'] = classify(b_val)
+                        row['Classification_Percentage'] = self._classification_percentage_str(b_val)
+                    else:
+                        row['Power_a'] = row['Power_b'] = row['R2'] = ''
+                        row['Classification'] = 'NO_FIT'
+                        row['Classification_Percentage'] = ''
+
+                    rows.append(row)
+
+                if rows:
+                    df_out = pd.DataFrame(rows)
+                    csv_path = os.path.join(group_folder, f"{struct_name}_{label}_unit_case_comparison.csv")
+                    df_out.to_csv(csv_path, index=False)
+                    self.log(f"  Unit case comparison saved: {csv_path} ({len(rows)} rows, "
+                              f"{len(thicknesses_sorted)} thickness columns)")
+
+        except Exception as e:
+            self.log(f"  Unit case comparison error: {e}")
             import traceback
             self.log(traceback.format_exc())
 
