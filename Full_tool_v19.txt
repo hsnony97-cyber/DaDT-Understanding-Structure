@@ -3328,8 +3328,11 @@ class BarPropertySolverTab:
                 t_arr = np.array([p[0] for p in points])
                 s_arr = np.array([p[1] for p in points])
 
-                # Need at least 2 positive points for power law fit
-                valid = (t_arr > 0) & (s_arr > 0)
+                # Need at least 2 nonzero-stress points for power law fit.
+                # Fit is done on |stress| (log-log needs positive values) -
+                # this lets compression (negative stress) elements be fit
+                # too; only the magnitude trend (b, R2) is affected, not sign.
+                valid = (t_arr > 0) & (s_arr != 0)
                 t_valid = t_arr[valid]
                 s_valid = s_arr[valid]
 
@@ -3347,17 +3350,18 @@ class BarPropertySolverTab:
                     continue
 
                 try:
-                    # Log-space linear regression for power law: log(s) = log(a) + b*log(t)
+                    # Log-space linear regression for power law: log(|s|) = log(a) + b*log(t)
+                    s_abs = np.abs(s_valid)
                     log_t = np.log(t_valid)
-                    log_s = np.log(s_valid)
+                    log_s = np.log(s_abs)
                     coeffs = np.polyfit(log_t, log_s, 1)
                     b_val = coeffs[0]
                     a_val = np.exp(coeffs[1])
 
-                    # R^2 calculation
+                    # R^2 calculation (against |stress|, same basis as the fit)
                     s_pred = a_val * np.power(t_valid, b_val)
-                    ss_res = np.sum((s_valid - s_pred) ** 2)
-                    ss_tot = np.sum((s_valid - np.mean(s_valid)) ** 2)
+                    ss_res = np.sum((s_abs - s_pred) ** 2)
+                    ss_tot = np.sum((s_abs - np.mean(s_abs)) ** 2)
                     r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
                     fit_rows.append({
@@ -3449,9 +3453,12 @@ class BarPropertySolverTab:
             for eid, points in elem_data.items():
                 t_arr = np.array([p[0] for p in points])
                 s_arr = np.array([p[1] for p in points])
-                valid = (t_arr > 0) & (s_arr > 0)
+                # Fit on |stress| so compression (negative stress) elements
+                # get a fit too - log-log needs positive values; only the
+                # magnitude trend (b, R2) is affected, not sign.
+                valid = (t_arr > 0) & (s_arr != 0)
                 t_v = t_arr[valid]
-                s_v = s_arr[valid]
+                s_v = np.abs(s_arr[valid])
                 if len(t_v) >= 2:
                     try:
                         log_t = np.log(t_v)
@@ -3602,8 +3609,11 @@ class BarPropertySolverTab:
                 return
 
             def power_law_fit(t_arr, s_arr):
-                valid = (t_arr > 0) & (s_arr > 0)
-                t_v, s_v = t_arr[valid], s_arr[valid]
+                # Fit on |stress| so compression (negative stress) rows get
+                # a fit too - log-log needs positive values; only the
+                # magnitude trend (b, R2) is affected, not sign.
+                valid = (t_arr > 0) & (s_arr != 0)
+                t_v, s_v = t_arr[valid], np.abs(s_arr[valid])
                 if len(t_v) < 2:
                     return None
                 try:
@@ -3688,8 +3698,11 @@ class BarPropertySolverTab:
             thicknesses_sorted = sorted(gr['thickness'] for gr in group_results)
 
             def power_law_fit(t_arr, s_arr):
-                valid = (t_arr > 0) & (s_arr > 0)
-                t_v, s_v = t_arr[valid], s_arr[valid]
+                # Fit on |stress| so compression (negative stress) rows get
+                # a fit too - log-log needs positive values; only the
+                # magnitude trend (b, R2) is affected, not sign.
+                valid = (t_arr > 0) & (s_arr != 0)
+                t_v, s_v = t_arr[valid], np.abs(s_arr[valid])
                 if len(t_v) < 2:
                     return None
                 try:
