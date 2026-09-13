@@ -23,13 +23,96 @@ from pyNastran.bdf.bdf import BDF
 from pyNastran.op2.op2 import OP2
 import numpy as np
 
+_APP_COLORS = {}  # populated by _configure_app_style(); shared palette for both tabs
+
+
+def _configure_app_style(root):
+    """One-time visual theme for the whole app. Both tabs share this root's
+    ttk.Style singleton, so configuring it once here restyles every ttk
+    widget in both tabs without touching how any of them behave. Pure
+    look-and-feel - no widget's command/callback is affected."""
+    colors = {
+        'bg': '#f1f5f9',
+        'surface': '#ffffff',
+        'text': '#0f172a',
+        'muted': '#64748b',
+        'border': '#cbd5e1',
+        'primary': '#2563eb',
+        'primary_dark': '#1d4ed8',
+        'success': '#16a34a',
+        'success_dark': '#15803d',
+        'danger': '#dc2626',
+        'danger_dark': '#b91c1c',
+        'log_bg': '#0f172a',
+        'log_fg': '#e2e8f0',
+    }
+
+    root.configure(bg=colors['bg'])
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use('clam')
+    except tk.TclError:
+        pass
+
+    base_font = ('Segoe UI', 10)
+    section_font = ('Segoe UI', 10, 'bold')
+
+    style.configure('.', background=colors['bg'], foreground=colors['text'], font=base_font)
+    style.configure('TFrame', background=colors['bg'])
+    style.configure('TLabel', background=colors['bg'], foreground=colors['text'])
+    style.configure('TCheckbutton', background=colors['bg'])
+
+    style.configure('Header.TLabel', font=('Segoe UI', 15, 'bold'),
+                    foreground=colors['primary_dark'], background=colors['bg'])
+    style.configure('Subtitle.TLabel', font=('Segoe UI', 9),
+                    foreground=colors['muted'], background=colors['bg'])
+
+    style.configure('TLabelframe', background=colors['bg'], bordercolor=colors['border'])
+    style.configure('TLabelframe.Label', background=colors['bg'],
+                    foreground=colors['primary_dark'], font=section_font)
+
+    style.configure('TNotebook', background=colors['bg'], borderwidth=0)
+    style.configure('TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=(16, 8),
+                    background=colors['border'], foreground=colors['text'])
+    style.map('TNotebook.Tab',
+              background=[('selected', colors['surface'])],
+              foreground=[('selected', colors['primary_dark'])])
+
+    style.configure('TButton', font=base_font, padding=(10, 5),
+                    background=colors['surface'], foreground=colors['text'])
+    style.map('TButton', background=[('active', colors['border'])])
+
+    style.configure('Accent.TButton', font=('Segoe UI', 10, 'bold'), padding=(14, 7),
+                    background=colors['primary'], foreground='white')
+    style.map('Accent.TButton',
+              background=[('active', colors['primary_dark']), ('disabled', colors['border'])],
+              foreground=[('disabled', colors['muted'])])
+
+    style.configure('Danger.TButton', font=('Segoe UI', 10, 'bold'), padding=(14, 7),
+                    background=colors['danger'], foreground='white')
+    style.map('Danger.TButton',
+              background=[('active', colors['danger_dark']), ('disabled', colors['border'])],
+              foreground=[('disabled', colors['muted'])])
+
+    style.configure('TEntry', padding=4, fieldbackground=colors['surface'], bordercolor=colors['border'])
+    style.configure('TCombobox', padding=4)
+
+    style.configure('Horizontal.TProgressbar', troughcolor=colors['border'],
+                    background=colors['primary'], bordercolor=colors['border'], thickness=14)
+
+    _APP_COLORS.update(colors)
+    return colors
+
 
 class IntegratedBDFRFTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Integrated BDF Tool v16.0")
-        self.root.geometry("1100x950")
-        
+        self.root.geometry("1150x950")
+        self.root.minsize(1000, 700)
+        self.colors = _configure_app_style(self.root)
+
         # Tab 1 variables
         self.thermal_bdfs = []
         self.maneuver_bdfs = []
@@ -44,15 +127,21 @@ class IntegratedBDFRFTool:
         self.setup_ui()
     
     def setup_ui(self):
+        banner = ttk.Frame(self.root, padding=(16, 12))
+        banner.pack(fill=tk.X)
+        ttk.Label(banner, text="\U0001F527 Integrated BDF Tool", style='Header.TLabel').pack(side=tk.LEFT)
+        ttk.Label(banner, text="  v16.0", style='Subtitle.TLabel').pack(side=tk.LEFT, pady=(6, 0))
+        ttk.Separator(self.root, orient='horizontal').pack(fill=tk.X)
+
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
         self.tab1 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab1, text="BDF Merge Preparation")
+        self.notebook.add(self.tab1, text="\U0001F4C4  BDF Merge Preparation")
         self.setup_tab1()
-        
+
         self.tab3 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab3, text="Understanding Structure Type")
+        self.notebook.add(self.tab3, text="\U0001F9EE  Understanding Structure Type")
         self.tab3_tool = BarPropertySolverTab(self.tab3, self.root)
 
     
@@ -60,10 +149,10 @@ class IntegratedBDFRFTool:
         main = ttk.Frame(self.tab1, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(main, text="BDF Merge Preparation v8", font=('Helvetica', 14, 'bold')).pack(pady=(0,10))
-        
+        ttk.Label(main, text="BDF Merge Preparation v8", style='Header.TLabel').pack(pady=(0,10))
+
         # === THERMAL SECTION ===
-        thermal_main = ttk.LabelFrame(main, text="THERMAL", padding="5")
+        thermal_main = ttk.LabelFrame(main, text="\U0001F321  THERMAL", padding="8")
         thermal_main.pack(fill=tk.X, pady=5)
         
         thm_master_f = ttk.Frame(thermal_main)
@@ -74,11 +163,16 @@ class IntegratedBDFRFTool:
         self.thermal_count = tk.StringVar(value="0 files")
         ttk.Label(thm_master_f, textvariable=self.thermal_count).pack(side=tk.LEFT, padx=5)
         
-        self.thermal_listbox = tk.Listbox(thermal_main, height=3, width=100)
+        self.thermal_listbox = tk.Listbox(thermal_main, height=3, width=100, font=('Segoe UI', 9),
+                                           bg=self.colors['surface'], fg=self.colors['text'],
+                                           selectbackground=self.colors['primary'], selectforeground='white',
+                                           relief='flat', highlightthickness=1,
+                                           highlightbackground=self.colors['border'],
+                                           highlightcolor=self.colors['primary'])
         self.thermal_listbox.pack(fill=tk.X, pady=2)
         
         # === MANEUVER SECTION ===
-        maneuver_main = ttk.LabelFrame(main, text="MANEUVER", padding="5")
+        maneuver_main = ttk.LabelFrame(main, text="\U0001F6EB  MANEUVER", padding="8")
         maneuver_main.pack(fill=tk.X, pady=5)
         
         man_master_f = ttk.Frame(maneuver_main)
@@ -89,11 +183,16 @@ class IntegratedBDFRFTool:
         self.maneuver_count = tk.StringVar(value="0 files")
         ttk.Label(man_master_f, textvariable=self.maneuver_count).pack(side=tk.LEFT, padx=5)
         
-        self.maneuver_listbox = tk.Listbox(maneuver_main, height=3, width=100)
+        self.maneuver_listbox = tk.Listbox(maneuver_main, height=3, width=100, font=('Segoe UI', 9),
+                                            bg=self.colors['surface'], fg=self.colors['text'],
+                                            selectbackground=self.colors['primary'], selectforeground='white',
+                                            relief='flat', highlightthickness=1,
+                                            highlightbackground=self.colors['border'],
+                                            highlightcolor=self.colors['primary'])
         self.maneuver_listbox.pack(fill=tk.X, pady=2)
         
         # === SETTINGS ===
-        sf = ttk.LabelFrame(main, text="Settings", padding="10")
+        sf = ttk.LabelFrame(main, text="⚙  Settings", padding="10")
         sf.pack(fill=tk.X, pady=5)
         ttk.Label(sf, text="Excel:").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.excel_path, width=70).grid(row=0, column=1, padx=5)
@@ -108,16 +207,20 @@ class IntegratedBDFRFTool:
         
         bf = ttk.Frame(main)
         bf.pack(fill=tk.X, pady=10)
-        self.process_btn = ttk.Button(bf, text=">>> PROCESS & MERGE <<<", command=self.start_processing)
+        self.process_btn = ttk.Button(bf, text="▶  PROCESS & MERGE", command=self.start_processing,
+                                       style='Accent.TButton')
         self.process_btn.pack(side=tk.LEFT, padx=5)
         ttk.Button(bf, text="Clear Log", command=self.clear_log1).pack(side=tk.LEFT)
-        
+
         self.progress1 = ttk.Progressbar(main, mode='indeterminate')
         self.progress1.pack(fill=tk.X, pady=5)
-        
-        lf = ttk.LabelFrame(main, text="Log", padding="10")
+
+        lf = ttk.LabelFrame(main, text="\U0001F4DC  Log", padding="10")
         lf.pack(fill=tk.BOTH, expand=True)
-        self.log_text1 = scrolledtext.ScrolledText(lf, height=15)
+        self.log_text1 = scrolledtext.ScrolledText(lf, height=15, font=('Consolas', 10),
+                                                    bg=self.colors['log_bg'], fg=self.colors['log_fg'],
+                                                    insertbackground=self.colors['log_fg'], relief='flat',
+                                                    borderwidth=0)
         self.log_text1.pack(fill=tk.BOTH, expand=True)
     
     # ============= TAB 1 HELPERS =============
@@ -1319,11 +1422,12 @@ class BarPropertySolverTab:
 
         main = scrollable_frame
 
-        ttk.Label(main, text="Bar Property Solver v1.0", font=('Helvetica', 16, 'bold')).pack(pady=10)
-        ttk.Label(main, text="Per-structure thickness sweep with combined stress output", foreground='gray').pack()
+        ttk.Label(main, text="Bar Property Solver v1.0", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Per-structure thickness sweep with combined stress output",
+                 style='Subtitle.TLabel').pack()
 
         # ---- Section 1: Input Files ----
-        f1 = ttk.LabelFrame(main, text="1. Input Files", padding=10)
+        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Input Files", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
         # All BDF Files
@@ -1333,7 +1437,12 @@ class BarPropertySolverTab:
 
         bdf_list_frame = ttk.Frame(bdf_frame)
         bdf_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.bdf_listbox = tk.Listbox(bdf_list_frame, height=3, width=55, selectmode=tk.SINGLE)
+        self.bdf_listbox = tk.Listbox(bdf_list_frame, height=3, width=55, selectmode=tk.SINGLE,
+                                       font=('Segoe UI', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                       selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                       relief='flat', highlightthickness=1,
+                                       highlightbackground=_APP_COLORS['border'],
+                                       highlightcolor=_APP_COLORS['primary'])
         self.bdf_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         bdf_scroll = ttk.Scrollbar(bdf_list_frame, orient="vertical", command=self.bdf_listbox.yview)
         bdf_scroll.pack(side=tk.LEFT, fill=tk.Y)
@@ -1357,7 +1466,12 @@ class BarPropertySolverTab:
 
         man_list_frame = ttk.Frame(man_frame)
         man_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.maneuver_listbox = tk.Listbox(man_list_frame, height=3, width=55, selectmode=tk.SINGLE)
+        self.maneuver_listbox = tk.Listbox(man_list_frame, height=3, width=55, selectmode=tk.SINGLE,
+                                            font=('Segoe UI', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                            selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                            relief='flat', highlightthickness=1,
+                                            highlightbackground=_APP_COLORS['border'],
+                                            highlightcolor=_APP_COLORS['primary'])
         self.maneuver_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         man_scroll = ttk.Scrollbar(man_list_frame, orient="vertical", command=self.maneuver_listbox.yview)
         man_scroll.pack(side=tk.LEFT, fill=tk.Y)
@@ -1427,7 +1541,7 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
 
         # ---- Section 2: Thickness Ranges ----
-        f2 = ttk.LabelFrame(main, text="2. Thickness Ranges (mm)", padding=10)
+        f2 = ttk.LabelFrame(main, text="\U0001F4CF  2. Thickness Ranges (mm)", padding=10)
         f2.pack(fill=tk.X, pady=5, padx=10)
 
         row1 = ttk.Frame(f2)
@@ -1451,14 +1565,16 @@ class BarPropertySolverTab:
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # ---- Section 3: Actions ----
-        f3 = ttk.LabelFrame(main, text="3. Actions", padding=10)
+        f3 = ttk.LabelFrame(main, text="▶  3. Actions", padding=10)
         f3.pack(fill=tk.X, pady=5, padx=10)
 
         btn_row = ttk.Frame(f3)
         btn_row.pack(fill=tk.X)
-        self.btn_start = ttk.Button(btn_row, text=">>> START SWEEP", command=self.start_sweep, state=tk.DISABLED)
+        self.btn_start = ttk.Button(btn_row, text="▶  START SWEEP", command=self.start_sweep,
+                                     state=tk.DISABLED, style='Accent.TButton')
         self.btn_start.pack(side=tk.LEFT, padx=5)
-        self.btn_stop = ttk.Button(btn_row, text="STOP", command=self.stop_sweep, state=tk.DISABLED)
+        self.btn_stop = ttk.Button(btn_row, text="■  STOP", command=self.stop_sweep,
+                                    state=tk.DISABLED, style='Danger.TButton')
         self.btn_stop.pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row, text="Export", command=self.export_results).pack(side=tk.LEFT, padx=5)
@@ -1468,17 +1584,23 @@ class BarPropertySolverTab:
         self.progress_bar.pack(fill=tk.X, pady=5)
 
         # ---- Section 4: Structure Groups ----
-        f4 = ttk.LabelFrame(main, text="4. Structure Groups (from Property Excel)", padding=10)
+        f4 = ttk.LabelFrame(main, text="\U0001F9E9  4. Structure Groups (from Property Excel)", padding=10)
         f4.pack(fill=tk.X, pady=5, padx=10)
 
-        self.group_text = scrolledtext.ScrolledText(f4, height=6, width=100, state=tk.DISABLED)
+        self.group_text = scrolledtext.ScrolledText(f4, height=6, width=100, state=tk.DISABLED,
+                                                      font=('Consolas', 10),
+                                                      bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                                      relief='flat', borderwidth=0)
         self.group_text.pack(fill=tk.X)
 
         # ---- Section 5: Log ----
-        f5 = ttk.LabelFrame(main, text="5. Log", padding=10)
+        f5 = ttk.LabelFrame(main, text="\U0001F4DC  5. Log", padding=10)
         f5.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
 
-        self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100)
+        self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100, font=('Consolas', 10),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def _add_file_row(self, parent, label, var, load_cmd):
