@@ -1281,6 +1281,7 @@ class BarPropertySolverTab:
         self.pbarl_dims = {}              # PID -> {'dim1': val, 'dim2': val} from BDF
         self.current_bar_thicknesses = {} # PID -> base thickness (from load_properties)
         self.current_skin_thicknesses = {}# PID -> effective thickness (Excel 'Skin Property' if given, else BDF), for base model + offsets
+        self.original_skin_thicknesses = {} # PID -> raw PSHELL thickness from BDF (fallback only)
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
         self.material_densities = {}      # MID -> density
@@ -1644,15 +1645,23 @@ class BarPropertySolverTab:
                     self.original_bar_thicknesses[pid] = d['dim1']
                     self.log(f"    PID {pid}: dim1={d['dim1']}, dim2={d['dim2']}")
 
-            # Extract PSHELL thicknesses from BDF (for offset calculations only - not modified)
-            self.current_skin_thicknesses = {}
+            # Extract PSHELL thicknesses from BDF (fallback for offset calc when
+            # a PID isn't in the Excel 'Skin Property' sheet). Stored separately
+            # from self.current_skin_thicknesses (the effective value actually
+            # used) and merged via _refresh_effective_skin_thicknesses, so
+            # whichever of load_bdf()/load_properties() the user happens to run
+            # second never silently discards the other's data - there is no
+            # "Load BDF" button, so this runs lazily from start_sweep() and can
+            # easily land AFTER load_properties() in the normal click order.
+            self.original_skin_thicknesses = {}
             for pid, prop in self.bdf_model.properties.items():
                 if prop.type == 'PSHELL':
                     t = prop.t if hasattr(prop, 't') and prop.t is not None else None
                     if t is not None:
-                        self.current_skin_thicknesses[pid] = t
-            if self.current_skin_thicknesses:
-                self.log(f"  PSHELL thicknesses extracted: {len(self.current_skin_thicknesses)} properties (for offsets only)")
+                        self.original_skin_thicknesses[pid] = t
+            if self.original_skin_thicknesses:
+                self.log(f"  PSHELL thicknesses extracted: {len(self.original_skin_thicknesses)} properties (fallback for offset calc)")
+            self._refresh_effective_skin_thicknesses()
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
             self.log(f"  Centroids calculated: {len(self.element_centroids)}")
@@ -1747,13 +1756,13 @@ class BarPropertySolverTab:
                         self.skin_properties[pid] = {'thickness': t}
                     except Exception:
                         pass
-                # These become the effective skin thickness for the base model AND offset calc
-                for pid, d in self.skin_properties.items():
-                    self.current_skin_thicknesses[pid] = d['thickness']
                 self.log(f"    Base skin thicknesses loaded: {len(self.skin_properties)} properties")
             else:
                 self.log("  WARNING: No 'Skin Property' sheet found - skin thickness "
                           "will fall back to BDF PSHELL values (unchanged).")
+            # Recompute the effective thickness (Excel first, BDF fallback) now,
+            # regardless of whether load_bdf() has run yet or not.
+            self._refresh_effective_skin_thicknesses()
 
             # ---- 3. Structure grouping ('Bar Property Structure Type' sheet) ----
             self.log(f"\n  Reading structure groups from '{struct_sheet}'...")
@@ -1851,6 +1860,20 @@ class BarPropertySolverTab:
                 pid_str += f" ... (+{len(pids) - 15} more)"
             self.group_text.insert(tk.END, f"{name} ({len(pids)} props): {pid_str}\n")
         self.group_text.config(state=tk.DISABLED)
+
+    def _refresh_effective_skin_thicknesses(self):
+        """Recompute self.current_skin_thicknesses - the effective value used
+        for offset calc - as: Excel 'Skin Property' sheet value if given,
+        else the BDF's own PSHELL thickness (self.original_skin_thicknesses).
+        There is no dedicated "Load BDF" button - load_bdf() only runs lazily
+        from start_sweep() - so load_bdf() and load_properties() can each run
+        in either order relative to the other. Calling this from both after
+        they update their own half of the data means neither one's data ever
+        gets silently discarded by the other running afterward."""
+        merged = dict(self.original_skin_thicknesses)
+        for pid, d in self.skin_properties.items():
+            merged[pid] = d['thickness']
+        self.current_skin_thicknesses = merged
 
     # ==================== ELEMENT IDs (OFFSET) ====================
     def load_element_ids(self):
