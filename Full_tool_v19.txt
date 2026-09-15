@@ -3035,6 +3035,29 @@ class BarPropertySolverTab:
             self.log(f"    Offset error: {e}")
             return bdf_path
 
+    # ==================== STRUCTURE-ONLY BDF (NO INCLUDES) ====================
+    def _write_structure_only_bdf(self, bdf_path, folder):
+        """Write a copy of the given (prop-updated + offseted) BDF with INCLUDE cards
+        removed, so only the structure itself remains, without needing the include files."""
+        try:
+            with open(bdf_path, 'r', encoding='latin-1') as f:
+                lines = f.readlines()
+
+            new_lines = [l for l in lines if not l.strip().upper().startswith('INCLUDE')]
+            removed = len(lines) - len(new_lines)
+
+            base, ext = os.path.splitext(bdf_path)
+            output_bdf = base + "_stru" + ext
+            with open(output_bdf, 'w', encoding='latin-1') as f:
+                f.writelines(new_lines)
+
+            self.log(f"    Structure-only BDF written: {os.path.basename(output_bdf)} ({removed} include lines removed)")
+            return output_bdf
+
+        except Exception as e:
+            self.log(f"    Structure-only BDF error: {e}")
+            return None
+
     # ==================== NASTRAN EXECUTION ====================
     def _run_nastran(self, bdf_path, folder):
         nastran = self.nastran_path.get()
@@ -3168,6 +3191,10 @@ class BarPropertySolverTab:
 
                 # 2. Apply offsets (from updated maneuver BDF)
                 offset_bdf = self._apply_offsets(bdf_path, bdf_subfolder, updated_maneuver)
+
+                # 2b. Also write a structure-only copy (INCLUDE cards removed)
+                if offset_bdf:
+                    self._write_structure_only_bdf(offset_bdf, bdf_subfolder)
 
                 # 3. Run Nastran
                 self.log("    Running Nastran...")
