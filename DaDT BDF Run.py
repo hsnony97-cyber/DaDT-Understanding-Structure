@@ -3,7 +3,7 @@
 DaDT Structure Definition Tool v16.0
 =====================================
 Tab 1: BDF Merge Preparation
-Tab 2: Understanding Structure Type (maneuver->thermal offset, 'Bar Property Structure Type' sheet)
+Tab 2: Understanding Structure Type (apply 'Bar Property'/'Skin Property' + offsets, solve base model)
 """
 
 import tkinter as tk
@@ -1431,8 +1431,6 @@ class BarPropertySolverTab:
         self.bdf_models = []
         self.bar_properties = {}          # PID -> {'dim1': val, 'dim2': val} (base model values)
         self.skin_properties = {}         # PID -> {'thickness': val} from 'Skin Property' sheet
-        self.bar_structure_map = {}       # PID -> Structure Name
-        self.structure_groups = {}        # Structure Name -> [PID list]
         self.pbarl_dims = {}              # PID -> {'dim1': val, 'dim2': val} from BDF
         self.current_bar_thicknesses = {} # PID -> base thickness (from load_properties)
         self.current_skin_thicknesses = {}# PID -> effective thickness (Excel 'Skin Property' if given, else BDF), for base model + offsets
@@ -1453,6 +1451,7 @@ class BarPropertySolverTab:
 
         # Run state
         self.is_running = False
+        self.properties_loaded = False
         self.base_stresses = None          # Raw stresses from the base model solve
 
         self.setup_ui()
@@ -1598,18 +1597,8 @@ class BarPropertySolverTab:
         self.progress_bar = ttk.Progressbar(f3, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=5)
 
-        # ---- Section 3: Structure Groups ----
-        f4 = ttk.LabelFrame(main, text="\U0001F9E9  3. Structure Groups (from Property Excel)", padding=10)
-        f4.pack(fill=tk.X, pady=5, padx=10)
-
-        self.group_text = scrolledtext.ScrolledText(f4, height=6, width=100, state=tk.DISABLED,
-                                                      font=('Consolas', 10),
-                                                      bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
-                                                      relief='flat', borderwidth=0)
-        self.group_text.pack(fill=tk.X)
-
-        # ---- Section 4: Log ----
-        f5 = ttk.LabelFrame(main, text="\U0001F4DC  4. Log", padding=10)
+        # ---- Section 3: Log ----
+        f5 = ttk.LabelFrame(main, text="\U0001F4DC  3. Log", padding=10)
         f5.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
 
         self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100, font=('Consolas', 10),
@@ -1820,10 +1809,10 @@ class BarPropertySolverTab:
 
     # ==================== PROPERTY LOADING ====================
     def load_properties(self):
-        """Load structure grouping ('Bar Property Structure Type' sheet) plus the
-        Excel-defined base Dim1/Dim2 ('Bar Property' sheet) and skin thickness
-        ('Skin Property' sheet). These base values are what the base model gets
-        written with (see _build_base_model)."""
+        """Load the Excel-defined bar Dim1/Dim2 ('Bar Property' sheet) and skin
+        thickness ('Skin Property' sheet). These are the values the base model
+        gets written with (see _build_base_model); any PID without an entry in
+        either sheet keeps its original BDF value untouched."""
         path = self.property_excel_path.get()
         if not path:
             messagebox.showerror("Error", "Select Property Excel")
@@ -1837,54 +1826,49 @@ class BarPropertySolverTab:
             xl = pd.ExcelFile(path)
             self.log(f"  Sheets: {xl.sheet_names}")
 
-            bar_min = self.default_bar_thickness
-
-            # ---- Locate the 3 sheets we care about ----
-            struct_sheet = bar_dim_sheet = skin_sheet = None
+            # ---- Locate the Bar/Skin Property sheets. No structure-grouping
+            # sheet is read anymore - there is no sweep to group by, only a
+            # single base-model solve, so every PID that has an entry in
+            # 'Bar Property'/'Skin Property' gets that value applied; any PID
+            # without one keeps its original BDF value untouched. ----
+            bar_dim_sheet = skin_sheet = None
             for sheet in xl.sheet_names:
                 sl = sheet.lower().replace('_', '').replace(' ', '').replace('-', '')
-                if 'bar' in sl and 'prop' in sl and 'structure' in sl:
-                    struct_sheet = sheet
-                elif sl == 'barproperty':
+                if sl == 'barproperty':
                     bar_dim_sheet = sheet
                 elif sl == 'skinproperty':
                     skin_sheet = sheet
-            # Fallback partial match for Bar/Skin Property sheets (skip the structure sheet)
+            # Fallback partial match for Bar/Skin Property sheets
             for sheet in xl.sheet_names:
-                if sheet == struct_sheet:
-                    continue
                 sl = sheet.lower().replace('_', '').replace(' ', '').replace('-', '')
                 if bar_dim_sheet is None and 'bar' in sl and 'prop' in sl:
                     bar_dim_sheet = sheet
                 elif skin_sheet is None and 'skin' in sl and 'prop' in sl:
                     skin_sheet = sheet
 
-            if struct_sheet is None:
-                raise ValueError("No 'Bar Property Structure Type' sheet found "
-                                  "(expects sheet/column names containing 'bar', 'prop', 'structure')")
-
-            # ---- 1. Excel base Dim1/Dim2 ('Bar Property' sheet: PID, Dim1, Dim2) ----
-            excel_bar_dims = {}
+            # ---- 1. Excel bar Dim1/Dim2 ('Bar Property' sheet: PID, Dim1, Dim2) ----
+            self.bar_properties = {}
+            self.current_bar_thicknesses = {}
             if bar_dim_sheet:
-                self.log(f"\n  Reading base bar Dim1/Dim2 from '{bar_dim_sheet}'...")
+                self.log(f"\n  Reading bar Dim1/Dim2 from '{bar_dim_sheet}'...")
                 df_bar = pd.read_excel(xl, sheet_name=bar_dim_sheet)
                 for _, row in df_bar.iterrows():
                     try:
                         pid = int(row.iloc[0])
                         d1 = float(row.iloc[1])
                         d2 = float(row.iloc[2]) if len(df_bar.columns) > 2 else d1
-                        excel_bar_dims[pid] = {'dim1': d1, 'dim2': d2}
+                        self.bar_properties[pid] = {'dim1': d1, 'dim2': d2}
+                        self.current_bar_thicknesses[pid] = d1
                     except Exception:
                         pass
-                self.log(f"    Base bar dimensions loaded: {len(excel_bar_dims)} properties")
+                self.log(f"    Bar dimensions loaded: {len(self.bar_properties)} properties")
             else:
-                self.log("  WARNING: No 'Bar Property' sheet found - bar base thickness "
-                          "will fall back to BDF PBARL values where possible.")
+                self.log("  No 'Bar Property' sheet found - bar dimensions will be left as-is (BDF values).")
 
-            # ---- 2. Excel base skin thickness ('Skin Property' sheet: PID, Thickness) ----
+            # ---- 2. Excel skin thickness ('Skin Property' sheet: PID, Thickness) ----
             self.skin_properties = {}
             if skin_sheet:
-                self.log(f"\n  Reading base skin thickness from '{skin_sheet}'...")
+                self.log(f"\n  Reading skin thickness from '{skin_sheet}'...")
                 df_skin = pd.read_excel(xl, sheet_name=skin_sheet)
                 for _, row in df_skin.iterrows():
                     try:
@@ -1893,111 +1877,28 @@ class BarPropertySolverTab:
                         self.skin_properties[pid] = {'thickness': t}
                     except Exception:
                         pass
-                self.log(f"    Base skin thicknesses loaded: {len(self.skin_properties)} properties")
+                self.log(f"    Skin thicknesses loaded: {len(self.skin_properties)} properties")
             else:
-                self.log("  WARNING: No 'Skin Property' sheet found - skin thickness "
-                          "will fall back to BDF PSHELL values (unchanged).")
+                self.log("  No 'Skin Property' sheet found - skin thickness will be left as-is (BDF values).")
             # Recompute the effective thickness (Excel first, BDF fallback) now,
             # regardless of whether load_bdf() has run yet or not.
             self._refresh_effective_skin_thicknesses()
 
-            # ---- 3. Structure grouping ('Bar Property Structure Type' sheet) ----
-            self.log(f"\n  Reading structure groups from '{struct_sheet}'...")
-            df = pd.read_excel(xl, sheet_name=struct_sheet)
-            self.log(f"    Columns: {list(df.columns)}")
-
-            # Find columns by name
-            pid_col = None
-            struct_col = None
-            for col in df.columns:
-                col_clean = str(col).lower().replace('_', '').replace(' ', '')
-                if 'barproperty' in col_clean or 'propertyid' in col_clean or col_clean == 'barpropid':
-                    pid_col = col
-                elif 'structure' in col_clean or 'structurename' in col_clean:
-                    struct_col = col
-
-            # Fallback to positional
-            if pid_col is None:
-                pid_col = df.columns[0]
-                self.log(f"    Using first column as PID: {pid_col}")
-            if struct_col is None and len(df.columns) > 1:
-                struct_col = df.columns[1]
-                self.log(f"    Using second column as Structure Name: {struct_col}")
-
-            self.log(f"    PID column: {pid_col}")
-            self.log(f"    Structure column: {struct_col}")
-
-            self.bar_properties = {}
-            self.bar_structure_map = {}
-            self.structure_groups = {}
-            self.current_bar_thicknesses = {}
-
-            for _, row in df.iterrows():
-                pid_val = row[pid_col]
-                if pd.isna(pid_val):
-                    continue
-                pid = int(pid_val)
-                struct_name = str(row[struct_col]).strip() if struct_col and pd.notna(row[struct_col]) else "DEFAULT"
-
-                # Base Dim1/Dim2: prefer the Excel 'Bar Property' sheet, else fall back to BDF PBARL
-                if pid in excel_bar_dims:
-                    dim1 = excel_bar_dims[pid]['dim1']
-                    dim2 = excel_bar_dims[pid]['dim2']
-                else:
-                    dim1 = self.original_bar_thicknesses.get(pid, bar_min)
-                    dim2 = self.pbarl_dims[pid]['dim2'] if pid in self.pbarl_dims else bar_min
-
-                self.bar_properties[pid] = {
-                    'dim1': dim1,
-                    'dim2': dim2,
-                }
-                # Initialize to the base value (Excel-derived where available)
-                self.current_bar_thicknesses[pid] = dim1
-                self.bar_structure_map[pid] = struct_name
-
-                if struct_name not in self.structure_groups:
-                    self.structure_groups[struct_name] = []
-                self.structure_groups[struct_name].append(pid)
-
-            self.log(f"  Loaded {len(self.bar_properties)} bar properties")
-            self.log(f"  Structure groups: {len(self.structure_groups)}")
-            for name, pids in sorted(self.structure_groups.items()):
-                self.log(f"    {name}: {len(pids)} properties")
-
-            from_excel = sum(1 for pid in self.bar_properties if pid in excel_bar_dims)
-            self.log(f"  Base Dim1/Dim2 source: {from_excel} from 'Bar Property' sheet, "
-                      f"{len(self.bar_properties) - from_excel} from BDF (fallback)")
-
-            # Update group display
-            self._update_group_display()
-
             total = len(self.bar_properties)
-            groups = len(self.structure_groups)
             self.prop_status.config(
-                text=f"Loaded: {total} bar props / {groups} groups, {len(self.skin_properties)} skin props",
+                text=f"Loaded: {total} bar props, {len(self.skin_properties)} skin props",
                 foreground="green"
             )
-            # Excel (structure groups) is what the solve actually needs - only
-            # enable the solve button once it's successfully loaded.
-            self.btn_start.config(state=tk.NORMAL if self.structure_groups else tk.DISABLED)
+            self.properties_loaded = True
+            self.btn_start.config(state=tk.NORMAL)
 
         except Exception as e:
             self.log(f"ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
             self.prop_status.config(text="Error", foreground="red")
+            self.properties_loaded = False
             self.btn_start.config(state=tk.DISABLED)
-
-    def _update_group_display(self):
-        self.group_text.config(state=tk.NORMAL)
-        self.group_text.delete(1.0, tk.END)
-        for name in sorted(self.structure_groups.keys()):
-            pids = self.structure_groups[name]
-            pid_str = ", ".join(str(p) for p in sorted(pids)[:15])
-            if len(pids) > 15:
-                pid_str += f" ... (+{len(pids) - 15} more)"
-            self.group_text.insert(tk.END, f"{name} ({len(pids)} props): {pid_str}\n")
-        self.group_text.config(state=tk.DISABLED)
 
     def _refresh_effective_skin_thicknesses(self):
         """Recompute self.current_skin_thicknesses - the effective value used
@@ -2742,10 +2643,9 @@ class BarPropertySolverTab:
                                     'subcase': int(sc_id)
                                 })
 
-                                struct_name = self.bar_structure_map.get(pid, '') if pid else ''
                                 bar_stress_rows.append({
                                     'OP2': op2_name, 'Subcase': int(sc_id), 'Element': int(eid),
-                                    'Property': pid, 'Structure': struct_name,
+                                    'Property': pid,
                                     'Axial': float(axial) if axial else 0,
                                     'Dim1': d1, 'Dim2': d2, 'Area': area,
                                     'Stress': float(stress) if stress else None
@@ -2788,7 +2688,7 @@ class BarPropertySolverTab:
             csv_path = os.path.join(folder, 'bar_stress_results.csv')
             with open(csv_path, 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=[
-                    'OP2', 'Subcase', 'Element', 'Property', 'Structure', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'
+                    'OP2', 'Subcase', 'Element', 'Property', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'
                 ])
                 w.writeheader()
                 w.writerows(bar_stress_rows)
@@ -2845,7 +2745,7 @@ class BarPropertySolverTab:
             self.load_bdf()
         if not self.bdf_model:
             return
-        if not self.structure_groups:
+        if not self.properties_loaded:
             messagebox.showerror("Error", "Load Property Excel first")
             return
 
@@ -2865,7 +2765,7 @@ class BarPropertySolverTab:
             self.log("\n" + "=" * 70)
             self.log("SOLVING BASE MODEL")
             self.log("=" * 70)
-            self.log(f"  Structure groups: {len(self.structure_groups)}")
+            self.log(f"  Bar properties: {len(self.bar_properties)}, Skin properties: {len(self.skin_properties)}")
             self.log(f"  Output: {run_folder}")
 
             self.root.after(0, lambda: self.progress_var.set(10))
